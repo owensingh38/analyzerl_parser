@@ -10,3 +10,4 @@ dist/
 docs/build/
 docs/source/api/
 analyzerl_boxcars/target/
+BUILD.md

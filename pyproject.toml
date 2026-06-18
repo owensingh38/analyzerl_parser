@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.0"]
+build-backend = "maturin"
+
+[project]
+name = "analyzerl_parser"
+version = "1.0.2"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.scripts]
+analyzerl-boxcars = "analyzerl_parser.cli:main"
+
+[tool.maturin]
+manifest-path = "analyzerl_boxcars/Cargo.toml"
+module-name = "analyzerl_parser._boxcars"
+python-source = "."
+include = [
+    { path = "analyzerl_boxcars/target/release/analyzerl_boxcars", format = "wheel" },
+    { path = "analyzerl_boxcars/target/release/analyzerl_boxcars.exe", format = "wheel" },
+]

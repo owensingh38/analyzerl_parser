@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pkg-check/
+build/
+dist/
+*.egg-info/
+docs/build/
+docs/source/api/
+analyzerl_boxcars/target/

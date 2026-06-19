@@ -13,6 +13,24 @@ OutputType: TypeAlias = Literal["frames", "pbp"]
 ExportFormat: TypeAlias = Literal["csv", "parquet"]
 
 _DATA_DIR = Path.cwd()
+_CSV_FLOAT_COLUMNS = (
+    "history_seconds_since_kickoff",
+    "history_weighted_event_count",
+    "history_weighted_touch_count",
+    "history_weighted_turnover_count",
+    "history_weighted_pass_count",
+    "history_weighted_shot_count",
+    "history_weighted_goal_count",
+    "history_weighted_save_count",
+    "history_weighted_clear_count",
+    "history_weighted_kickoff_count",
+    "history_weighted_demo_count",
+    "history_weighted_bump_count",
+    "history_weighted_challenge_count",
+    "history_weighted_entry_count",
+    "history_weighted_exit_count",
+    "history_weighted_retrieval_count",
+)
 
 
 def set_data_dir(path: str | os.PathLike[str]) -> Path:
@@ -172,7 +190,11 @@ def _prepare_replay_inputs(replay_path: ReplayPathInput) -> list[Path]:
         resolved = _path(replay_path)
 
         if resolved.is_dir():
-            return [resolved]
+            direct_replays = sorted(resolved.glob("*.replay"))
+            recursive_replays = _replay_files(resolved)
+            if len(direct_replays) == len(recursive_replays):
+                return [resolved]
+            return recursive_replays
 
     return replay_files
 
@@ -222,6 +244,31 @@ def _output_config(
     raise ValueError("output must be one of: 'frames', 'pbp'")
 
 
+def _export_path_config(
+    export: str | os.PathLike[str],
+    output: OutputType | str,
+    export_format: ExportFormat | str | None,
+    replay_path: ReplayPathInput,
+    limit: int | None,
+) -> tuple[Path, Path | None, dict[str, str]]:
+    export_path = _path(export)
+    suffix = export_path.suffix.lower()
+    file_target = None
+
+    if suffix in {".csv", ".parquet"}:
+        inferred_format = suffix[1:]
+        if export_format is not None and str(export_format).lower() != inferred_format:
+            raise ValueError("export_format conflicts with the export path suffix")
+        replay_count = len(_apply_limit(_replay_files(replay_path), limit))
+        if replay_count != 1:
+            raise ValueError("file export paths can only be used with exactly one replay")
+        export_format = inferred_format
+        file_target = export_path
+        export_path = export_path.parent
+
+    return export_path, file_target, _output_config(output, export_format)
+
+
 def _expected_export_files(
     replay_path: ReplayPathInput,
     export_path: Path,
@@ -235,10 +282,50 @@ def _expected_export_files(
     ]
 
 
+def _actual_export_files(
+    replay_path: ReplayPathInput,
+    export_path: Path,
+    config: dict[str, str],
+    limit: int | None,
+    file_target: Path | None = None,
+) -> list[Path]:
+    expected = [
+        path
+        for path in _expected_export_files(replay_path, export_path, config, limit)
+        if path.exists()
+    ]
+
+    if file_target is not None:
+        if file_target.exists() and not expected:
+            return [file_target]
+        if not expected:
+            return []
+
+        source = expected[0]
+        file_target.parent.mkdir(parents=True, exist_ok=True)
+        if source.resolve() != file_target.resolve():
+            source.replace(file_target)
+        return [file_target]
+
+    return expected
+
+
+def _assert_export_files(export_files: Sequence[Path], expected_count: int) -> None:
+    if len(export_files) != expected_count:
+        preview = [str(path) for path in export_files[:20]]
+        if len(export_files) > 20:
+            preview.append(f"... {len(export_files) - 20} more")
+        raise FileNotFoundError(
+            f"Parser produced {len(export_files)} export files, expected {expected_count}. "
+            f"Found: {preview}"
+        )
+
+
 def _read_export_files(
     export_files: Iterable[Path],
     return_type: ReturnType | str,
     export_format: ExportFormat | str,
+    xg_model_path: str | os.PathLike[str] | None = None,
 ):
     return_type = str(return_type).lower()
     export_format = str(export_format).lower()
@@ -246,20 +333,44 @@ def _read_export_files(
     if return_type == "polars":
         import polars as pl
 
+        export_files = list(export_files)
         if not export_files:
             return pl.DataFrame()
 
-        reader = pl.read_parquet if export_format == "parquet" else pl.read_csv
-        return pl.concat(
-            [reader(path) for path in export_files],
-            how="vertical_relaxed",
-        )
+        if export_format == "parquet":
+            frame = pl.scan_parquet(export_files).collect()
+        else:
+            frame = pl.scan_csv(
+                export_files,
+                schema_overrides={
+                    column: pl.Float64
+                    for column in _CSV_FLOAT_COLUMNS
+                },
+            ).collect()
+
+        if xg_model_path is not None:
+            from .xg import apply_xg_to_pbp
+
+            frame = apply_xg_to_pbp(frame, xg_model_path)
+
+        return frame
 
     if return_type == "pandas":
         import pandas as pd
 
         if not export_files:
             return pd.DataFrame()
+
+        if xg_model_path is not None:
+            from .xg import apply_xg_to_pbp
+
+            polars_frame = _read_export_files(
+                export_files,
+                "polars",
+                export_format,
+                xg_model_path=xg_model_path,
+            )
+            return polars_frame.to_pandas()
 
         reader = pd.read_parquet if export_format == "parquet" else pd.read_csv
         return pd.concat(
@@ -279,6 +390,7 @@ def parse_replay(
     export_format: ExportFormat | None = None,
     force: bool = False,
     limit: int | None = None,
+    xg_model_path: str | os.PathLike[str] | None = None,
 ):
     """Parse one or more Rocket League replays with the bundled Rust CLI.
 
@@ -295,6 +407,9 @@ def parse_replay(
             ``frames`` and ``csv`` for ``pbp``.
         force: Whether to overwrite existing exports.
         limit: Optional replay count limit when ``replay_path`` is a directory.
+        xg_model_path: Optional saved xG model file or folder. When provided,
+            parsed PBP or frame exports are scored and an ``xG`` column is
+            added to shot and goal rows.
 
     Returns:
         A list of exported file paths, a pandas DataFrame, or a Polars
@@ -314,13 +429,16 @@ def parse_replay(
     if export is None:
         raise ValueError("export cannot be None")
 
-    config = _output_config(output, export_format)
-
+    export_path, file_target, config = _export_path_config(
+        export,
+        output,
+        export_format,
+        replay_path,
+        limit,
+    )
+    export_path.mkdir(parents=True, exist_ok=True)
     replay_inputs = _apply_limit(_prepare_replay_inputs(replay_path), limit)
-    export_path = None if export is None else _path(export)
-
-    if export_path is not None:
-        export_path.mkdir(parents=True, exist_ok=True)
+    expected_count = len(_apply_limit(_replay_files(replay_path), limit))
 
     workers = max(int(workers or 1), 1)
     binary = _boxcars_binary()
@@ -336,9 +454,8 @@ def parse_replay(
             str(workers),
         ]
 
-        if export_path is not None:
-            command.extend([config["out_arg"], str(export_path)])
-            command.extend(["--format", config["format"]])
+        command.extend([config["out_arg"], str(export_path)])
+        command.extend(["--format", config["format"]])
 
         if limit is not None and Path(replay_input).is_dir():
             command.extend(["--limit", str(int(limit))])
@@ -348,14 +465,27 @@ def parse_replay(
 
         _run_boxcars(command)
 
-    if export_path is not None:
-        export_files = [
-            path
-            for path in _expected_export_files(replay_path, export_path, config, limit)
-            if path.exists()
-        ]
+    export_files = _actual_export_files(
+        replay_path,
+        export_path,
+        config,
+        limit,
+        file_target=file_target,
+    )
+    _assert_export_files(export_files, expected_count)
+
+    if xg_model_path is not None:
+        from .xg import apply_xg_to_file
+
+        for export_file in export_files:
+            apply_xg_to_file(export_file, xg_model_path, config["format"])
 
     if return_type == "export":
         return export_files
 
-    return _read_export_files(export_files, return_type, config["format"])
+    return _read_export_files(
+        export_files,
+        return_type,
+        config["format"],
+        xg_model_path=None,
+    )

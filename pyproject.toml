@@ -8,9 +8,6 @@ version = "1.0.2"
 readme = "README.md"
 requires-python = ">=3.10"
 
-[project.scripts]
-analyzerl-boxcars = "analyzerl_parser.cli:main"
-
 [tool.maturin]
 manifest-path = "analyzerl_boxcars/Cargo.toml"
 module-name = "analyzerl_parser._boxcars"

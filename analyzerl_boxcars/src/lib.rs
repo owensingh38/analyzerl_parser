@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use arrow_array::{ArrayRef, BooleanArray, Float32Array, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use boxcars::{Attribute, HeaderProp, Replay, UpdatedAttribute};
+use boxcars::{Attribute, HeaderProp, RemoteId, Replay, UniqueId, UpdatedAttribute};
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -24,6 +24,15 @@ const CROSSBAR_HEIGHT: f32 = 642.775;
 const CHALLENGE_TOUCH_BALL_DISTANCE: f32 = 425.0;
 const CHALLENGE_TOUCH_PLAYER_DISTANCE: f32 = 750.0;
 const CHALLENGE_EVENT_COOLDOWN_FRAMES: i32 = 30;
+const PRESS_CARRIER_DISTANCE: f32 = 900.0;
+const PRESS_BALL_DISTANCE: f32 = 900.0;
+const PRESS_EVENT_COOLDOWN_FRAMES: i32 = 60;
+const SHADOW_MIN_CARRIER_DISTANCE: f32 = 500.0;
+const SHADOW_MAX_CARRIER_DISTANCE: f32 = 1800.0;
+const SHADOW_LATERAL_DISTANCE: f32 = 1400.0;
+const SHADOW_MIN_CARRIER_SPEED_TOWARD_NET: f32 = 250.0;
+const SHADOW_EVENT_COOLDOWN_FRAMES: i32 = 90;
+const DEMO_RESPAWN_FRAMES: i32 = 90;
 const OFF_DEMO_SECONDS: f32 = 2.0;
 const OFF_CHALLENGE_SECONDS: f32 = 5.0;
 const OFF_FLIP_RESET_SECONDS: f32 = 2.0;
@@ -347,6 +356,8 @@ struct PendingOfficialStatEvent {
 #[derive(Clone, Debug)]
 struct PlayerInfo {
     id: String,
+    actor_id: String,
+    network_id: String,
     name: String,
     team: i32,
     slot: String,
@@ -368,9 +379,17 @@ struct PbpContext {
     orange_team_name: String,
     players: Vec<PlayerInfo>,
     official_stats: Vec<OfficialStatEvent>,
+    game_presence_events: Vec<GamePresenceEvent>,
     demo_events: Vec<CarContactEvent>,
     ball_events: Vec<BallEvent>,
     frame_states: Vec<FrameSnapshot>,
+}
+
+#[derive(Clone, Debug)]
+struct GamePresenceEvent {
+    frame_number: i32,
+    player_name: String,
+    event_type: &'static str,
 }
 
 #[derive(Clone, Debug)]
@@ -2141,6 +2160,18 @@ fn build_pbp_rows(game_id: &str, replay: &Replay) -> Result<(PbpContext, Vec<Pbp
         });
     }
 
+    add_game_presence_events(
+        &mut rows,
+        &context,
+        &players,
+        &player_static_values,
+        game_id,
+        &match_guid,
+        &replay_name,
+        &map_id,
+        team_size,
+        &game_time,
+    );
     sort_pbp_rows(&mut rows);
     filter_goal_to_kickoff_rows(&mut rows, &goal_frames);
     sort_pbp_rows(&mut rows);
@@ -2163,6 +2194,18 @@ fn build_pbp_rows(game_id: &str, replay: &Replay) -> Result<(PbpContext, Vec<Pbp
 
     //Add derived possession, contact, boost, and aerial reset events.
     add_zone_events(
+        &mut rows,
+        &context,
+        &player_static_values,
+        game_id,
+        &match_guid,
+        &replay_name,
+        &map_id,
+        team_size,
+        &game_time,
+    );
+    sort_pbp_rows(&mut rows);
+    add_pressure_events(
         &mut rows,
         &context,
         &player_static_values,
@@ -3091,15 +3134,61 @@ fn cell_bool(value: Option<&CellValue>) -> Option<bool> {
     }
 }
 
+fn header_player_id(player: &[(String, HeaderProp)], index: usize) -> String {
+    let online_id = prop_string(player, "OnlineID").unwrap_or_default();
+    if !online_id.is_empty() && online_id != "0" {
+        return online_id;
+    }
+
+    let name = prop_string(player, "Name")
+        .or_else(|| prop_string(player, "PlayerName"))
+        .unwrap_or_else(|| format!("player_{index}"));
+    let team = prop_i32(player, "Team")
+        .or_else(|| prop_i32(player, "PlayerTeam"))
+        .unwrap_or(0);
+    format!("{team}:{index}:{name}")
+}
+
+fn unique_id_to_network_id(unique_id: &UniqueId) -> String {
+    match &unique_id.remote_id {
+        RemoteId::PlayStation(value) => format!("playstation:{}", value.online_id),
+        RemoteId::PsyNet(value) => format!("psynet:{}", value.online_id),
+        RemoteId::SplitScreen(value) => format!("splitscreen:{value}"),
+        RemoteId::Steam(value) => format!("steam:{value}"),
+        RemoteId::Switch(value) => format!("switch:{}", value.online_id),
+        RemoteId::Xbox(value) => format!("xbox:{value}"),
+        RemoteId::QQ(value) => format!("qq:{value}"),
+        RemoteId::Epic(value) => format!("epic:{value}"),
+    }
+}
+
+fn unique_id_to_player_id(unique_id: &UniqueId) -> String {
+    match &unique_id.remote_id {
+        RemoteId::PlayStation(value) => value.online_id.to_string(),
+        RemoteId::PsyNet(value) => value.online_id.to_string(),
+        RemoteId::SplitScreen(value) => value.to_string(),
+        RemoteId::Steam(value) => value.to_string(),
+        RemoteId::Switch(value) => value.online_id.to_string(),
+        RemoteId::Xbox(value) => value.to_string(),
+        RemoteId::QQ(value) => value.to_string(),
+        RemoteId::Epic(value) => value.to_string(),
+    }
+}
+
 fn pbp_players(replay: &Replay) -> Vec<PlayerInfo> {
     let mut players_by_team = Vec::new();
     if let Some(player_stats) = header_array(replay, "PlayerStats") {
-        for player in player_stats {
-            let team = prop_i32(player, "Team")
-                .or_else(|| prop_i32(player, "PlayerTeam"))
-                .unwrap_or(0);
+        for (idx, player) in player_stats.iter().enumerate() {
+            let Some(team @ 0..=1) =
+                prop_i32(player, "Team").or_else(|| prop_i32(player, "PlayerTeam"))
+            else {
+                continue;
+            };
+            let online_id = prop_string(player, "OnlineID").unwrap_or_default();
             players_by_team.push(PlayerInfo {
-                id: prop_string(player, "OnlineID").unwrap_or_default(),
+                id: header_player_id(player, idx),
+                actor_id: String::new(),
+                network_id: online_id,
                 name: prop_string(player, "Name")
                     .or_else(|| prop_string(player, "PlayerName"))
                     .unwrap_or_default(),
@@ -3162,6 +3251,7 @@ fn pbp_context(replay: &Replay) -> PbpContext {
     let mut latest_hit_team: Option<i32> = None;
     let mut latest_match_stats: HashMap<(i32, &'static str), i32> = HashMap::new();
     let mut pending_official_stats: Vec<PendingOfficialStatEvent> = Vec::new();
+    let mut active_player_names: HashSet<String> = HashSet::new();
     let mut hit_candidates: Vec<HitCandidate> = Vec::new();
     let goal_frames = header_goal_frames(replay);
     let player_team_by_name = context
@@ -3190,6 +3280,13 @@ fn pbp_context(replay: &Replay) -> PbpContext {
                 match (&name[..], &updated_actor.attribute) {
                     ("Engine.PlayerReplicationInfo:PlayerName", Attribute::String(value)) => {
                         pri_name.insert(updated_actor.actor_id.0, value.clone());
+                        if let Some(player) = context_player_mut(
+                            &mut context.players,
+                            updated_actor.actor_id.0,
+                            &pri_name,
+                        ) {
+                            player.actor_id = updated_actor.actor_id.0.to_string();
+                        }
                         for (car_actor, pri_actor) in &car_pri {
                             if *pri_actor == updated_actor.actor_id.0 {
                                 car_player_name.insert(*car_actor, value.clone());
@@ -3203,7 +3300,46 @@ fn pbp_context(replay: &Replay) -> PbpContext {
                         );
                     }
                     ("Engine.PlayerReplicationInfo:Team", Attribute::ActiveActor(value)) => {
-                        pri_team_actor.insert(updated_actor.actor_id.0, value.actor.0);
+                        if value.active {
+                            pri_team_actor.insert(updated_actor.actor_id.0, value.actor.0);
+                        } else {
+                            pri_team_actor.remove(&updated_actor.actor_id.0);
+                        }
+                        if let Some(player_name) = pri_name.get(&updated_actor.actor_id.0).cloned()
+                        {
+                            let frame = i32::try_from(frame_number).unwrap_or(i32::MAX);
+                            if value.active {
+                                if active_player_names.insert(player_name.clone()) {
+                                    context.game_presence_events.push(GamePresenceEvent {
+                                        frame_number: frame,
+                                        player_name,
+                                        event_type: "game-join",
+                                    });
+                                }
+                            } else if active_player_names.remove(&player_name) {
+                                context.game_presence_events.push(GamePresenceEvent {
+                                    frame_number: frame,
+                                    player_name: player_name.clone(),
+                                    event_type: "game-leave",
+                                });
+                                if let Some(idx) = player_index_by_name.get(&player_name) {
+                                    if let Some(slot) = latest_player_states.get_mut(*idx) {
+                                        *slot = None;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    ("Engine.PlayerReplicationInfo:UniqueId", Attribute::UniqueId(value)) => {
+                        if let Some(player) = context_player_mut(
+                            &mut context.players,
+                            updated_actor.actor_id.0,
+                            &pri_name,
+                        ) {
+                            player.actor_id = updated_actor.actor_id.0.to_string();
+                            player.network_id = unique_id_to_network_id(value);
+                            player.id = unique_id_to_player_id(value);
+                        }
                     }
                     ("Engine.Pawn:PlayerReplicationInfo", Attribute::ActiveActor(value)) => {
                         car_pri.insert(updated_actor.actor_id.0, value.actor.0);
@@ -3672,7 +3808,9 @@ fn pbp_context(replay: &Replay) -> PbpContext {
                     if let Some(player_name) = pri_name.get(&updated_actor.actor_id.0) {
                         if let Some(team_number) = player_team_by_name.get(player_name) {
                             if let Attribute::ActiveActor(value) = &updated_actor.attribute {
-                                team_actor_number.insert(value.actor.0, *team_number);
+                                if value.active {
+                                    team_actor_number.insert(value.actor.0, *team_number);
+                                }
                             }
                         }
                     }
@@ -3688,6 +3826,10 @@ fn pbp_context(replay: &Replay) -> PbpContext {
         }
     }
     add_frame_seconds_elapsed(&mut context.frame_states);
+    let kickoff_starts = kickoff_start_frames_from_resets(&context.frame_states);
+    apply_kickoff_boost_resets(&mut context.frame_states, &kickoff_starts);
+    add_inferred_initial_game_joins(&mut context);
+    add_demo_respawn_events(&mut context);
 
     for player in &mut context.players {
         if player.first_frame_in_game.is_empty() {
@@ -3701,7 +3843,6 @@ fn pbp_context(replay: &Replay) -> PbpContext {
         None,
     );
     dedupe_official_stats(&mut context.official_stats);
-    let kickoff_starts = kickoff_start_frames_from_resets(&context.frame_states);
     context.ball_events = classify_ball_events(
         filter_duplicate_hits(hit_candidates),
         &context.players,
@@ -3750,12 +3891,132 @@ fn record_demo_event(
     last_demo_victim_frame.insert(victim_name, frame_number);
 }
 
+fn add_game_presence_events(
+    rows: &mut Vec<PbpEventRecord>,
+    context: &PbpContext,
+    players: &[PlayerInfo],
+    player_static_values: &[(String, String)],
+    game_id: &str,
+    match_guid: &str,
+    replay_name: &str,
+    map_id: &str,
+    team_size: Option<i32>,
+    game_time: &str,
+) {
+    let mut seen = HashSet::new();
+    for event in &context.game_presence_events {
+        if event.player_name.is_empty()
+            || !seen.insert((
+                event.frame_number,
+                event.player_name.clone(),
+                event.event_type,
+            ))
+        {
+            continue;
+        }
+
+        let mut values = pbp_base_values(
+            game_id,
+            match_guid,
+            replay_name,
+            map_id,
+            context,
+            team_size,
+            game_time,
+        );
+        values.insert("event_type".to_string(), event.event_type.to_string());
+        values.insert("frame_number".to_string(), event.frame_number.to_string());
+        values.insert(
+            "observed_frame_number".to_string(),
+            event.frame_number.to_string(),
+        );
+        insert_seconds_elapsed(&mut values, context, event.frame_number);
+        add_event_player(&mut values, players, 1, &event.player_name);
+        if let Some(player) = players
+            .iter()
+            .find(|player| player.name == event.player_name)
+        {
+            values.insert("event_team".to_string(), team_name(player.team).to_string());
+        }
+        add_pbp_players(&mut values, player_static_values);
+        add_frame_state_values(&mut values, context, event.frame_number, players);
+        add_spatial_features(&mut values, players);
+        rows.push(PbpEventRecord {
+            frame_number: Some(event.frame_number),
+            event_type: event.event_type.to_string(),
+            values,
+        });
+    }
+}
+
 fn dedupe_official_stats(official_stats: &mut Vec<OfficialStatEvent>) {
     let mut seen = std::collections::HashSet::new();
     official_stats
         .sort_by_key(|stat| (stat.frame_number, stat.player_name.clone(), stat.stat_type));
     official_stats
         .retain(|stat| seen.insert((stat.player_name.clone(), stat.stat_type, stat.stat_number)));
+}
+
+fn add_inferred_initial_game_joins(context: &mut PbpContext) {
+    let mut joined = context
+        .game_presence_events
+        .iter()
+        .filter(|event| event.event_type == "game-join")
+        .map(|event| event.player_name.clone())
+        .collect::<HashSet<_>>();
+
+    for (idx, player) in context.players.iter().enumerate() {
+        if joined.contains(&player.name) {
+            continue;
+        }
+        if let Some(snapshot) = context
+            .frame_states
+            .iter()
+            .find(|snapshot| snapshot.players.get(idx).and_then(Option::as_ref).is_some())
+        {
+            context.game_presence_events.push(GamePresenceEvent {
+                frame_number: snapshot.frame_number,
+                player_name: player.name.clone(),
+                event_type: "game-join",
+            });
+            joined.insert(player.name.clone());
+        }
+    }
+}
+
+fn add_demo_respawn_events(context: &mut PbpContext) {
+    let mut seen = context
+        .game_presence_events
+        .iter()
+        .map(|event| {
+            (
+                event.frame_number,
+                event.player_name.clone(),
+                event.event_type,
+            )
+        })
+        .collect::<HashSet<_>>();
+
+    for demo in &context.demo_events {
+        if demo.player_2_name.is_empty() {
+            continue;
+        }
+        let target_frame = demo.frame_number + DEMO_RESPAWN_FRAMES;
+        let frame_number = context
+            .frame_states
+            .iter()
+            .find(|snapshot| snapshot.frame_number >= target_frame)
+            .map(|snapshot| snapshot.frame_number)
+            .unwrap_or(target_frame);
+        let key = (frame_number, demo.player_2_name.clone(), "respawn");
+        if seen.insert(key) {
+            context.game_presence_events.push(GamePresenceEvent {
+                frame_number,
+                player_name: demo.player_2_name.clone(),
+                event_type: "respawn",
+            });
+        }
+    }
 }
 
 fn context_player_mut<'a>(
@@ -4217,6 +4478,47 @@ fn kickoff_start_frames_from_resets(frames: &[FrameSnapshot]) -> Vec<i32> {
         in_center_reset = centered;
     }
     starts
+}
+
+fn apply_kickoff_boost_resets(frames: &mut [FrameSnapshot], kickoff_starts: &[i32]) {
+    for (kickoff_idx, start_frame) in kickoff_starts.iter().copied().enumerate() {
+        let next_start = kickoff_starts
+            .get(kickoff_idx + 1)
+            .copied()
+            .unwrap_or(i32::MAX);
+        let player_count = frames
+            .iter()
+            .find(|snapshot| snapshot.frame_number >= start_frame)
+            .map(|snapshot| snapshot.players.len())
+            .unwrap_or(0);
+        let mut resetting = vec![true; player_count];
+
+        for snapshot in frames.iter_mut().filter(|snapshot| {
+            snapshot.frame_number >= start_frame && snapshot.frame_number < next_start
+        }) {
+            for (idx, player_state) in snapshot.players.iter_mut().enumerate() {
+                if !resetting.get(idx).copied().unwrap_or(false) {
+                    continue;
+                }
+                let Some(state) = player_state.as_mut() else {
+                    continue;
+                };
+                if state
+                    .boost_updated_frame
+                    .map(|frame| frame > start_frame)
+                    .unwrap_or(false)
+                {
+                    if let Some(slot) = resetting.get_mut(idx) {
+                        *slot = false;
+                    }
+                    continue;
+                }
+                state.boost = Some(33);
+                state.boost_collect = None;
+                state.boost_updated_frame = Some(start_frame);
+            }
+        }
+    }
 }
 
 fn filter_goal_to_kickoff_rows(rows: &mut Vec<PbpEventRecord>, goal_frames: &[(i32, String)]) {
@@ -5323,7 +5625,11 @@ fn pbp_player_static_values(players: &[PlayerInfo]) -> Vec<(String, String)> {
     let mut values = Vec::with_capacity(players.len() * 12);
     for player in players {
         values.push((format!("{}_id", player.slot), player.id.clone()));
-        values.push((format!("{}_network_id", player.slot), player.id.clone()));
+        values.push((format!("{}_actor_id", player.slot), player.actor_id.clone()));
+        values.push((
+            format!("{}_network_id", player.slot),
+            player.network_id.clone(),
+        ));
         values.push((format!("{}_name", player.slot), player.name.clone()));
         values.push((format!("{}_platform", player.slot), player.platform.clone()));
         values.push((format!("{}_is_bot", player.slot), player.is_bot.clone()));
@@ -5360,6 +5666,10 @@ fn add_event_player(
         values.insert(
             format!("event_player_{event_player_number}_id"),
             player.id.clone(),
+        );
+        values.insert(
+            format!("event_player_{event_player_number}_actor_id"),
+            player.actor_id.clone(),
         );
         values.insert(
             format!("event_player_{event_player_number}_team"),
@@ -5955,6 +6265,180 @@ fn touch_zone_event_controlled(event: &BallEvent, context: &PbpContext) -> bool 
         .and_then(|idx| context.players.get(idx))
         .map(|player| player.name == event.player_name)
         .unwrap_or(false)
+}
+
+fn add_pressure_events(
+    rows: &mut Vec<PbpEventRecord>,
+    context: &PbpContext,
+    player_static_values: &[(String, String)],
+    game_id: &str,
+    match_guid: &str,
+    replay_name: &str,
+    map_id: &str,
+    team_size: Option<i32>,
+    game_time: &str,
+) {
+    let third = BACK_WALL_Y / 3.0;
+    let mut last_event_frame: HashMap<(&'static str, String, String), i32> = HashMap::new();
+
+    for snapshot in &context.frame_states {
+        let ball = match snapshot.ball {
+            Some(value) if value.has_pos => value,
+            _ => continue,
+        };
+        let Some(carrier_idx) = closest_possessor(snapshot, &context.players, ball.pos) else {
+            continue;
+        };
+        let Some(carrier) = context.players.get(carrier_idx) else {
+            continue;
+        };
+        let Some(carrier_state) = snapshot.players.get(carrier_idx).and_then(Option::as_ref) else {
+            continue;
+        };
+        if !carrier_state.entity.has_pos {
+            continue;
+        }
+
+        for (defender_idx, defender) in context.players.iter().enumerate() {
+            if defender.team == carrier.team {
+                continue;
+            }
+            let Some(defender_state) = snapshot.players.get(defender_idx).and_then(Option::as_ref)
+            else {
+                continue;
+            };
+            if !defender_state.entity.has_pos {
+                continue;
+            }
+
+            let carrier_pos = carrier_state.entity.pos;
+            let defender_pos = defender_state.entity.pos;
+            let distance_to_carrier = vec_distance(defender_pos, carrier_pos);
+            let distance_to_ball = vec_distance(defender_pos, ball.pos);
+            if pressure_is_challenge_like(distance_to_carrier, distance_to_ball) {
+                continue;
+            }
+
+            let maybe_event = if pressure_is_press(
+                carrier.team,
+                carrier_pos.y,
+                distance_to_carrier,
+                distance_to_ball,
+                third,
+            ) {
+                Some(("press", PRESS_EVENT_COOLDOWN_FRAMES))
+            } else if pressure_is_shadow(
+                carrier.team,
+                defender.team,
+                carrier_pos,
+                defender_pos,
+                ball.vel.y,
+                carrier_state.entity.vel.y,
+                distance_to_carrier,
+            ) {
+                Some(("shadow", SHADOW_EVENT_COOLDOWN_FRAMES))
+            } else {
+                None
+            };
+
+            let Some((event_type, cooldown_frames)) = maybe_event else {
+                continue;
+            };
+            let key = (event_type, defender.name.clone(), carrier.name.clone());
+            let recent = last_event_frame
+                .get(&key)
+                .map(|frame| snapshot.frame_number - *frame <= cooldown_frames)
+                .unwrap_or(false);
+            if recent {
+                continue;
+            }
+
+            let mut row = build_zone_event_row(
+                event_type,
+                snapshot.frame_number,
+                defender.team,
+                Some(defender.name.as_str()),
+                false,
+                ball.pos,
+                None,
+                game_id,
+                match_guid,
+                replay_name,
+                map_id,
+                context,
+                player_static_values,
+                team_size,
+                game_time,
+            );
+            add_event_player(&mut row.values, &context.players, 2, &carrier.name);
+            row.values
+                .insert("distance".to_string(), distance_to_carrier.to_string());
+            rows.push(row);
+            last_event_frame.insert(key, snapshot.frame_number);
+        }
+    }
+}
+
+fn pressure_is_challenge_like(distance_to_carrier: f32, distance_to_ball: f32) -> bool {
+    distance_to_carrier <= CHALLENGE_TOUCH_PLAYER_DISTANCE
+        && distance_to_ball <= CHALLENGE_TOUCH_BALL_DISTANCE
+}
+
+fn pressure_is_press(
+    carrier_team: i32,
+    carrier_y: f32,
+    distance_to_carrier: f32,
+    distance_to_ball: f32,
+    third: f32,
+) -> bool {
+    in_defensive_third(carrier_team, carrier_y, third)
+        && distance_to_carrier <= PRESS_CARRIER_DISTANCE
+        && distance_to_ball <= PRESS_BALL_DISTANCE
+}
+
+fn pressure_is_shadow(
+    carrier_team: i32,
+    defender_team: i32,
+    carrier_pos: Vec3,
+    defender_pos: Vec3,
+    ball_vel_y: f32,
+    carrier_vel_y: f32,
+    distance_to_carrier: f32,
+) -> bool {
+    distance_to_carrier >= SHADOW_MIN_CARRIER_DISTANCE
+        && distance_to_carrier <= SHADOW_MAX_CARRIER_DISTANCE
+        && (defender_pos.x - carrier_pos.x).abs() <= SHADOW_LATERAL_DISTANCE
+        && defender_between_carrier_and_own_net(defender_team, defender_pos.y, carrier_pos.y)
+        && carrier_moving_toward_opponent_net(carrier_team, ball_vel_y, carrier_vel_y)
+}
+
+fn defender_between_carrier_and_own_net(
+    defender_team: i32,
+    defender_y: f32,
+    carrier_y: f32,
+) -> bool {
+    if defender_team == 1 {
+        defender_y > carrier_y
+    } else {
+        defender_y < carrier_y
+    }
+}
+
+fn carrier_moving_toward_opponent_net(
+    carrier_team: i32,
+    ball_vel_y: f32,
+    carrier_vel_y: f32,
+) -> bool {
+    let velocity_y = if ball_vel_y.abs() >= carrier_vel_y.abs() {
+        ball_vel_y
+    } else {
+        carrier_vel_y
+    };
+    if carrier_team == 1 {
+        velocity_y <= -SHADOW_MIN_CARRIER_SPEED_TOWARD_NET
+    } else {
+        velocity_y >= SHADOW_MIN_CARRIER_SPEED_TOWARD_NET
+    }
 }
 
 fn zone_event_exists(
@@ -6972,12 +7456,12 @@ fn post_process_pbp_rows(rows: &mut Vec<PbpEventRecord>, players: &[PlayerInfo])
                 flags.insert("pass_in_play", true);
             }
             let same_shooter = row_string(&prior.values, "event_player_1_id") == shooter_id;
-            if delta <= DRIBBLE_WINDOW_SECONDS && prior.event_type == "air_dribble" && same_shooter
+            if delta <= DRIBBLE_WINDOW_SECONDS && prior.event_type == "air-dribble" && same_shooter
             {
                 flags.insert("off_air_dribble", true);
             }
             if delta <= DRIBBLE_WINDOW_SECONDS
-                && prior.event_type == "ground_dribble"
+                && prior.event_type == "ground-dribble"
                 && same_shooter
             {
                 flags.insert("off_ground_dribble", true);
@@ -7092,8 +7576,8 @@ fn add_microstat_events(rows: &mut Vec<PbpEventRecord>) {
     let mut seen = HashSet::new();
     for row in rows.iter() {
         for (flag, event_type) in [
-            ("air_dribble", "air_dribble"),
-            ("ground_dribble", "ground_dribble"),
+            ("air_dribble", "air-dribble"),
+            ("ground_dribble", "ground-dribble"),
             ("flick_shot", "flick"),
         ] {
             if !truthy(row.values.get(flag)) {
@@ -7741,9 +8225,11 @@ fn pbp_columns() -> Vec<String> {
         "history_weighted_exit_count",
         "history_weighted_retrieval_count",
         "event_player_1_id",
+        "event_player_1_actor_id",
         "event_player_1_name",
         "event_player_1_team",
         "event_player_2_id",
+        "event_player_2_actor_id",
         "event_player_2_name",
         "event_player_2_team",
         "linked_shot_observed_frame_number",
@@ -7792,6 +8278,7 @@ fn pbp_columns() -> Vec<String> {
 
     let player_fields = [
         "id",
+        "actor_id",
         "network_id",
         "name",
         "platform",

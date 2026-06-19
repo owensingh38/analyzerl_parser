@@ -1,6 +1,5 @@
 """Replay animation helpers backed by the bundled AnalyzeRL parser."""
 
-import argparse
 import csv
 import io
 import json
@@ -8,13 +7,12 @@ import math
 import os
 import subprocess
 import sys
-from pathlib import Path
+import time
 from typing import Any, Literal
 
 from .parse import _boxcars_binary
 
 np = None
-cv2 = None
 animation = None
 plt = None
 Polygon = None
@@ -37,7 +35,7 @@ DEMO_RESPAWN_SECONDS = 3.0
 ANIMATION_FRAMES_PER_SECOND = 30.0
 DEFAULT_3D_VIEW_ELEV = 28
 DEFAULT_3D_VIEW_AZIM = -64
-DEFAULT_HIDDEN_EVENT_TYPES = {'boost-pickup'}
+DEFAULT_HIDDEN_EVENT_TYPES = {'boost-pickup', 'respawn'}
 BIG_BOOST_PADS = [
     (0, -4240),
     (-3584, -2484),
@@ -57,11 +55,6 @@ SMALL_BOOST_PADS = [
     (0, 2816), (-940, 3308), (940, 3308),
     (-3072, 4096), (-1792, 4184), (1792, 4184), (3072, 4096),
 ]
-FAST_EXPORT_WIDTH = 640
-FAST_EXPORT_HEIGHT = 900
-FAST_EXPORT_MARGIN = 32
-FAST_EXPORT_MAX_FRAMES = None
-
 
 def ensure_numpy():
     global np
@@ -70,17 +63,18 @@ def ensure_numpy():
         np = numpy_module
 
 
-def ensure_cv2():
-    global cv2
-    if cv2 is None:
-        import cv2 as cv2_module
-        cv2 = cv2_module
-
-
 def ensure_matplotlib():
     global animation, plt, Polygon, Rectangle, Button, Slider, Poly3DCollection
     if plt is not None:
         return
+    import matplotlib
+    if "agg" in matplotlib.get_backend().lower():
+        for backend in ["TkAgg", "QtAgg", "Qt5Agg"]:
+            try:
+                matplotlib.use(backend, force=True)
+                break
+            except Exception:
+                continue
     import matplotlib.animation as mpl_animation
     import matplotlib.pyplot as mpl_plt
     from matplotlib.patches import Polygon as MplPolygon, Rectangle as MplRectangle
@@ -112,14 +106,14 @@ def boost_amount(value):
     return int(min(max(boost, 0), 100))
 
 
-def load_replay_animation(replay_path, frame_step=2, parser_path=None):
+def load_replay_animation(replay_path, parser_path=None):
     command = [
         parser_path or boxcars_binary(),
         'animate-json',
         '--replay',
         replay_path,
         '--frame-step',
-        str(frame_step),
+        '1',
     ]
     result = subprocess.run(
         command,
@@ -134,6 +128,18 @@ def load_replay_animation(replay_path, frame_step=2, parser_path=None):
     payload = json.loads(result.stdout)
     payload['pbp'] = list(csv.DictReader(io.StringIO(payload.pop('pbp_csv', ''))))
     return payload
+
+
+def apply_xg_to_animation_rows(rows, xg_model_path=None):
+    if xg_model_path is None or not rows:
+        return rows
+
+    import polars as pl
+
+    from .xg import apply_xg_to_pbp
+
+    scored = apply_xg_to_pbp(pl.DataFrame(rows), xg_model_path)
+    return scored.to_dicts()
 
 
 def event_frame(row):
@@ -157,8 +163,14 @@ def event_label(row):
     player_1 = row.get('event_player_1_name', '')
     player_2 = row.get('event_player_2_name', '')
     team = row.get('event_team', '')
+    xg_value = parse_number(row.get('xG'))
+    xg_suffix = f' | xG {xg_value:.2f}' if event_type in ['shot', 'goal'] and math.isfinite(xg_value) else ''
     if event_type in ['demo', 'bump', 'challenge'] and player_2:
         return f'{event_type}: {player_1} -> {player_2}'
+    if event_type in ['shot', 'goal'] and player_1 and player_2:
+        return f'{event_type}: {player_1} | assist {player_2} ({team}){xg_suffix}'
+    if event_type in ['shot', 'goal'] and player_1:
+        return f'{event_type}: {player_1} ({team}){xg_suffix}'
     if player_1:
         return f'{event_type}: {player_1} ({team})'
     return f'{event_type}'
@@ -242,6 +254,36 @@ def build_demo_windows(rows):
             'end_seconds': seconds + DEMO_RESPAWN_SECONDS if math.isfinite(seconds) else float('nan'),
         })
     return windows
+
+
+def build_kickoff_reset_windows(frames):
+    windows = []
+    in_reset = False
+    last_start = -10_000
+    for frame in frames:
+        frame_number = int(frame.get('frame_number', -1))
+        ball = frame.get('ball') or {}
+        pos = ball.get('pos') or []
+        vel = ball.get('vel') or []
+        centered = (
+            len(pos) >= 3
+            and len(vel) >= 3
+            and abs(float(pos[0])) <= 25.0
+            and abs(float(pos[1])) <= 25.0
+            and 80.0 <= float(pos[2]) <= 110.0
+            and math.sqrt(float(vel[0]) ** 2 + float(vel[1]) ** 2 + float(vel[2]) ** 2) <= 150.0
+        )
+        if centered and not in_reset and frame_number - last_start > 300:
+            windows.append((frame_number, frame_number + int(ANIMATION_FRAMES_PER_SECOND * 3)))
+            last_start = frame_number
+        in_reset = centered
+    return windows
+
+
+def kickoff_boost_value(frame_number, boost, kickoff_windows):
+    if any(start <= frame_number <= end for start, end in kickoff_windows):
+        return 33
+    return boost
 
 
 def player_is_demoed(player, frame_number, seconds, demo_windows):
@@ -407,190 +449,8 @@ def draw_boost_pads_3d(ax):
                    alpha=0.98, depthshade=False, zorder=3)
 
 
-def export_replay_fast(
-    payload,
-    frames,
-    export_path,
-    export_fps=30,
-    event_window_frames=45,
-    event_types=None,
-    max_frames=FAST_EXPORT_MAX_FRAMES,
-    width=FAST_EXPORT_WIDTH,
-    height=FAST_EXPORT_HEIGHT,
-):
-    ensure_numpy()
-    ensure_cv2()
-    if not frames:
-        raise ValueError('No frames available to export')
-
-    extension = os.path.splitext(export_path)[1].lower()
-    if extension not in ['.gif', '.mp4']:
-        raise ValueError('Export path must end in .gif or .mp4')
-
-    output_folder = os.path.dirname(os.path.abspath(export_path))
-    if output_folder:
-        os.makedirs(output_folder, exist_ok=True)
-
-    step = 1
-    if max_frames is not None:
-        step = max(int(np.ceil(len(frames) / max(int(max_frames), 1))), 1)
-    export_frames = frames[::step]
-    if frames[-1] is not export_frames[-1]:
-        export_frames.append(frames[-1])
-
-    events_by_frame = build_event_index(payload['pbp'], event_types=event_types)
-    ensure_numpy()
-    event_frames = np.asarray(sorted(events_by_frame), dtype=np.int32)
-    score_timeline = build_score_timeline(payload['pbp'])
-    demo_windows = build_demo_windows(payload['pbp'])
-
-    def px(point_x, point_y):
-        x = FAST_EXPORT_MARGIN + (point_x + SIDE_WALL_X) * (width - 2 * FAST_EXPORT_MARGIN) / (SIDE_WALL_X * 2)
-        y = FAST_EXPORT_MARGIN + (BACK_NET_Y - point_y) * (height - 2 * FAST_EXPORT_MARGIN) / (BACK_NET_Y * 2)
-        return int(round(x)), int(round(y))
-
-    def visible_events_fast(frame_number):
-        if not event_frames.size:
-            return []
-        hit_frames = event_frames[
-            (event_frames >= frame_number - event_window_frames)
-            & (event_frames <= frame_number)
-        ]
-        output = []
-        for hit_frame in hit_frames:
-            output.extend(events_by_frame[int(hit_frame)])
-        return output[-3:]
-
-    field = np.full((height, width, 3), (29, 24, 21), dtype=np.uint8)
-    field_points = np.asarray([
-        px(-SIDE_WALL_X + CORNER_CATHETUS_LENGTH, -BACK_WALL_Y),
-        px(SIDE_WALL_X - CORNER_CATHETUS_LENGTH, -BACK_WALL_Y),
-        px(SIDE_WALL_X, -BACK_WALL_Y + CORNER_CATHETUS_LENGTH),
-        px(SIDE_WALL_X, BACK_WALL_Y - CORNER_CATHETUS_LENGTH),
-        px(SIDE_WALL_X - CORNER_CATHETUS_LENGTH, BACK_WALL_Y),
-        px(-SIDE_WALL_X + CORNER_CATHETUS_LENGTH, BACK_WALL_Y),
-        px(-SIDE_WALL_X, BACK_WALL_Y - CORNER_CATHETUS_LENGTH),
-        px(-SIDE_WALL_X, -BACK_WALL_Y + CORNER_CATHETUS_LENGTH),
-    ], dtype=np.int32)
-    cv2.polylines(field, [field_points], True, (236, 229, 223), 2, lineType=cv2.LINE_AA)
-    cv2.line(field, px(-SIDE_WALL_X, 0), px(SIDE_WALL_X, 0), (162, 146, 135), 1, lineType=cv2.LINE_AA)
-    cv2.rectangle(field, px(-GOAL_CENTER_TO_POST, -BACK_NET_Y), px(GOAL_CENTER_TO_POST, -BACK_WALL_Y), (168, 100, 38), 2)
-    cv2.rectangle(field, px(-GOAL_CENTER_TO_POST, BACK_WALL_Y), px(GOAL_CENTER_TO_POST, BACK_NET_Y), (54, 99, 193), 2)
-    for pad_x, pad_y in SMALL_BOOST_PADS:
-        cv2.circle(field, px(pad_x, pad_y), 2, (74, 210, 255), -1, lineType=cv2.LINE_AA)
-    for pad_x, pad_y in BIG_BOOST_PADS:
-        cv2.circle(field, px(pad_x, pad_y), 5, (47, 155, 255), -1, lineType=cv2.LINE_AA)
-
-    command = [
-        'ffmpeg',
-        '-hide_banner',
-        '-loglevel',
-        'error',
-        '-y',
-        '-f',
-        'rawvideo',
-        '-pix_fmt',
-        'bgr24',
-        '-s',
-        f'{width}x{height}',
-        '-r',
-        str(max(float(export_fps), 1.0)),
-        '-i',
-        '-',
-    ]
-    if extension == '.mp4':
-        command.extend([
-            '-an',
-            '-c:v',
-            'libx264',
-            '-preset',
-            'ultrafast',
-            '-tune',
-            'zerolatency',
-            '-pix_fmt',
-            'yuv420p',
-            '-movflags',
-            '+faststart',
-            export_path,
-        ])
-    else:
-        command.extend(['-loop', '0', export_path])
-
-    process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-    try:
-        for frame in export_frames:
-            image = field.copy()
-            frame_number = int(frame['frame_number'])
-            seconds = parse_number(frame.get('seconds_elapsed'))
-            ball_pos = frame_position(frame, 'ball')
-            if ball_pos:
-                cv2.circle(image, px(ball_pos[0], ball_pos[1]), 6, (223, 241, 245), -1, lineType=cv2.LINE_AA)
-            for player in frame.get('players', []):
-                if player_is_demoed(player, frame_number, seconds, demo_windows):
-                    continue
-                pos = player.get('pos')
-                if not pos or len(pos) < 3:
-                    continue
-                color = (255, 163, 74) if player.get('team') == 'blue' else (63, 125, 241)
-                center = px(float(pos[0]), float(pos[1]))
-                radius = 4 + int(max(min(float(pos[2]), CEILING_Z), 0) / CEILING_Z * 4)
-                cv2.circle(image, center, radius, color, -1, lineType=cv2.LINE_AA)
-                name = str(player.get('name') or '')
-                if name:
-                    name_size, _ = cv2.getTextSize(name, cv2.FONT_HERSHEY_SIMPLEX, 0.32, 1)
-                    cv2.putText(
-                        image,
-                        name,
-                        (center[0] - name_size[0] // 2, center[1] - radius - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.32,
-                        (244, 247, 251),
-                        1,
-                        cv2.LINE_AA,
-                    )
-                boost = boost_amount(player.get('boost'))
-                boost_label = str(boost) if boost is not None else ''
-                if boost_label:
-                    boost_size, _ = cv2.getTextSize(boost_label, cv2.FONT_HERSHEY_SIMPLEX, 0.32, 1)
-                    cv2.putText(
-                        image,
-                        boost_label,
-                        (center[0] - boost_size[0] // 2, center[1] + radius + 13),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.32,
-                        (244, 247, 251),
-                        1,
-                        cv2.LINE_AA,
-                    )
-
-            blue_score, orange_score = score_at_frame(score_timeline, frame_number)
-            title = replay_title(payload)
-            score_title = team_score_title(payload, blue_score, orange_score)
-            detail = f'{seconds:0.1f}s | frame {frame_number}' if math.isfinite(seconds) else f'frame {frame_number}'
-            cv2.putText(image, title[:78], (14, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (244, 247, 251), 1, cv2.LINE_AA)
-            cv2.putText(image, f'{score_title} | {detail}'[:78], (14, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (244, 247, 251), 1, cv2.LINE_AA)
-            for idx, row in enumerate(visible_events_fast(frame_number)):
-                cv2.putText(image, event_label(row)[:78], (14, height - 50 + idx * 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (244, 247, 251), 1, cv2.LINE_AA)
-            process.stdin.write(image.tobytes())
-    finally:
-        if process.stdin:
-            process.stdin.close()
-    stderr = process.stderr.read().decode('utf-8', errors='replace') if process.stderr else ''
-    return_code = process.wait()
-    if return_code != 0:
-        raise RuntimeError(f'ffmpeg export failed: {stderr.strip()}')
-    print(
-        f'Exported {len(export_frames):,}/{len(frames):,} frames to {export_path} '
-        f'(step={step})',
-        flush=True,
-    )
-    return export_path
-
-
 def animate_replay(
     replay_path: str | os.PathLike[str],
-    frame_step: int = 2,
-    interval: int = int(round(1000 / ANIMATION_FRAMES_PER_SECOND)),
     event_window_frames: int = 45,
     event_types: str | None = None,
     start_frame: int | None = None,
@@ -598,18 +458,14 @@ def animate_replay(
     parser_path: str | os.PathLike[str] | None = None,
     render_mode: Literal['2d', '3d'] = '3d',
     export_path: str | os.PathLike[str] | None = None,
-    export_fps: int = 30,
-    export_mode: Literal['fast'] = 'fast',
-    export_max_frames=FAST_EXPORT_MAX_FRAMES,
     view_elev: int = DEFAULT_3D_VIEW_ELEV,
     view_azim: int = DEFAULT_3D_VIEW_AZIM,
+    xg_model_path: str | os.PathLike[str] | None = None,
 ) -> Any:
     """Animate a replay interactively or export it as video.
 
     Args:
         replay_path: Replay file to animate.
-        frame_step: Frame downsampling step used by the parser.
-        interval: Playback interval in milliseconds.
         event_window_frames: Number of prior frames shown in the event feed.
         event_types: Optional comma-separated event filter.
         start_frame: Optional first frame to render.
@@ -617,17 +473,17 @@ def animate_replay(
         parser_path: Optional explicit parser executable path.
         render_mode: ``2d`` or ``3d``.
         export_path: Optional GIF or MP4 output path.
-        export_fps: Export frame rate.
-        export_mode: Export strategy name.
-        export_max_frames: Optional cap for fast export mode.
         view_elev: Initial 3D camera elevation.
         view_azim: Initial 3D camera azimuth.
+        xg_model_path: Optional saved xG model file or folder. When provided,
+            shot and goal events show an ``xG`` value.
 
     Returns:
         An export path for export mode, or the GUI timer for interactive mode.
     """
     render_mode = str(render_mode).lower()
-    payload = load_replay_animation(replay_path, frame_step=frame_step, parser_path=parser_path)
+    payload = load_replay_animation(replay_path, parser_path=parser_path)
+    payload['pbp'] = apply_xg_to_animation_rows(payload['pbp'], xg_model_path)
     frames = payload['frames']
     if start_frame is not None:
         frames = [frame for frame in frames if frame['frame_number'] >= start_frame]
@@ -635,25 +491,28 @@ def animate_replay(
         frames = [frame for frame in frames if frame['frame_number'] <= end_frame]
     if not frames:
         raise ValueError('No frames available for the requested range')
-    if export_path is not None and export_mode == 'fast' and render_mode == '2d':
-        return export_replay_fast(
-            payload,
-            frames,
-            export_path,
-            export_fps=export_fps,
-            event_window_frames=event_window_frames,
-            event_types=event_types,
-            max_frames=export_max_frames,
-        )
 
+    if export_path is None:
+        try:
+            import matplotlib
+            if "agg" in matplotlib.get_backend().lower():
+                matplotlib.use("TkAgg", force=True)
+        except Exception:
+            pass
     ensure_matplotlib()
     events_by_frame = build_event_index(payload['pbp'], event_types=event_types)
     ensure_numpy()
     event_frames = np.asarray(sorted(events_by_frame), dtype=np.int32)
     score_timeline = build_score_timeline(payload['pbp'])
     demo_windows = build_demo_windows(payload['pbp'])
+    kickoff_windows = build_kickoff_reset_windows(frames)
     is_3d = render_mode != '2d'
     is_export = export_path is not None
+    if not is_export and "agg" in plt.get_backend().lower():
+        try:
+            plt.switch_backend("TkAgg")
+        except Exception:
+            pass
     if is_3d:
         fig = plt.figure(figsize=(10, 9))
         ax = fig.add_subplot(111, projection='3d')
@@ -717,18 +576,17 @@ def animate_replay(
     state = {
         'frame_idx': 0,
         'playing': not is_export,
-        'base_interval': max(int(interval), 1),
-        'speed': 1.0,
+        'base_interval': int(round(1000 / ANIMATION_FRAMES_PER_SECOND)),
+        'play_start_time': None,
+        'play_start_idx': 0,
         'updating_slider': False,
     }
     frame_slider = None
-    speed_slider = None
     prev_button = None
     play_button = None
     next_button = None
     if not is_export:
-        frame_slider_ax = fig.add_axes([0.14, 0.075, 0.72, 0.025], facecolor='#20252b')
-        speed_slider_ax = fig.add_axes([0.14, 0.035, 0.24, 0.025], facecolor='#20252b')
+        frame_slider_ax = fig.add_axes([0.14, 0.065, 0.72, 0.025], facecolor='#20252b')
         prev_ax = fig.add_axes([0.43, 0.025, 0.08, 0.04])
         play_ax = fig.add_axes([0.53, 0.025, 0.10, 0.04])
         next_ax = fig.add_axes([0.65, 0.025, 0.08, 0.04])
@@ -742,20 +600,11 @@ def animate_replay(
             valstep=1,
             color='#4aa3ff',
         )
-        speed_slider = Slider(
-            speed_slider_ax,
-            'Speed',
-            0.1,
-            4.0,
-            valinit=1.0,
-            valstep=0.1,
-            color='#f17d3f',
-        )
         prev_button = Button(prev_ax, '<')
         play_button = Button(play_ax, 'Pause')
         next_button = Button(next_ax, '>')
 
-        for widget_ax in [frame_slider_ax, speed_slider_ax, prev_ax, play_ax, next_ax]:
+        for widget_ax in [frame_slider_ax, prev_ax, play_ax, next_ax]:
             widget_ax.tick_params(colors='#d9dee7')
             for spine in widget_ax.spines.values():
                 spine.set_color('#8792a2')
@@ -812,7 +661,7 @@ def animate_replay(
             else:
                 blue_points.append(point)
             name = player.get('name', '')
-            boost = boost_amount(player.get('boost'))
+            boost = kickoff_boost_value(frame_number, boost_amount(player.get('boost')), kickoff_windows)
             if is_3d:
                 player_labels.append(
                     ax.text(point[0], point[1], point[2] + 130, name, color='#f4f7fb',
@@ -851,12 +700,17 @@ def animate_replay(
             fig.canvas.draw_idle()
         return [ball_artist, blue_artist, orange_artist, title_text, event_text, *player_labels]
 
-    def set_timer_interval():
-        timer.interval = max(1, int(state['base_interval'] / state['speed']))
-
     def on_timer():
         if state['playing']:
-            next_idx = state['frame_idx'] + 1
+            now = time.perf_counter()
+            if state['play_start_time'] is None:
+                state['play_start_time'] = now
+                state['play_start_idx'] = state['frame_idx']
+                return True
+            elapsed = max(now - state['play_start_time'], 0.0)
+            next_idx = state['play_start_idx'] + int(elapsed * ANIMATION_FRAMES_PER_SECOND)
+            if next_idx <= state['frame_idx']:
+                return True
             if next_idx >= len(frames):
                 state['playing'] = False
                 play_button.label.set_text('Play')
@@ -867,23 +721,26 @@ def animate_replay(
     def on_frame_slider(value):
         if state['updating_slider']:
             return
+        state['playing'] = False
+        state['play_start_time'] = None
+        play_button.label.set_text('Play')
         draw_frame(int(value))
-
-    def on_speed_slider(value):
-        state['speed'] = float(value)
-        set_timer_interval()
 
     def on_play(_event):
         state['playing'] = not state['playing']
+        state['play_start_time'] = time.perf_counter()
+        state['play_start_idx'] = state['frame_idx']
         play_button.label.set_text('Pause' if state['playing'] else 'Play')
 
     def on_prev(_event):
         state['playing'] = False
+        state['play_start_time'] = None
         play_button.label.set_text('Play')
         draw_frame(state['frame_idx'] - 1)
 
     def on_next(_event):
         state['playing'] = False
+        state['play_start_time'] = None
         play_button.label.set_text('Play')
         draw_frame(state['frame_idx'] + 1)
 
@@ -896,6 +753,9 @@ def animate_replay(
             on_next(event)
 
     draw_frame(0)
+    if not is_export:
+        state['play_start_time'] = time.perf_counter()
+        state['play_start_idx'] = 0
     if is_export:
         if is_3d:
             ax.view_init(elev=view_elev, azim=view_azim)
@@ -904,9 +764,9 @@ def animate_replay(
             os.makedirs(output_folder, exist_ok=True)
         extension = os.path.splitext(export_path)[1].lower()
         if extension == '.gif':
-            writer = animation.PillowWriter(fps=max(float(export_fps), 1.0))
+            writer = animation.PillowWriter(fps=ANIMATION_FRAMES_PER_SECOND)
         elif extension == '.mp4':
-            writer = animation.FFMpegWriter(fps=max(float(export_fps), 1.0), bitrate=2400)
+            writer = animation.FFMpegWriter(fps=ANIMATION_FRAMES_PER_SECOND, bitrate=2400)
         else:
             raise ValueError('Export path must end in .gif or .mp4')
         print(f'Exporting {len(frames):,} {render_mode} rendered frames to {export_path}', flush=True)
@@ -923,15 +783,13 @@ def animate_replay(
         return export_path
 
     frame_slider.on_changed(on_frame_slider)
-    speed_slider.on_changed(on_speed_slider)
     play_button.on_clicked(on_play)
     prev_button.on_clicked(on_prev)
     next_button.on_clicked(on_next)
     fig.canvas.mpl_connect('key_press_event', on_key)
 
-    timer = fig.canvas.new_timer(interval=state['base_interval'])
+    timer = fig.canvas.new_timer(interval=5)
     timer.add_callback(on_timer)
-    set_timer_interval()
     timer.start()
     plt.show()
     return timer

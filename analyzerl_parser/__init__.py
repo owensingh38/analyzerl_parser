@@ -11,7 +11,7 @@ ExportFormat: TypeAlias = Literal["csv", "parquet"]
 StatsReturnType: TypeAlias = Literal["polars", "pandas", "list"]
 RenderMode: TypeAlias = Literal["2d", "3d"]
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 def parse_replay(
     replay_path: ReplayPathInput = "data/replays",

@@ -18,28 +18,22 @@ permissions:
   id-token: write
 
 jobs:
-  build:
+  build-binary:
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            artifact-name: linux-dist
+            artifact-name: linux-binary
             cli-path: analyzerl_boxcars/target/release/analyzerl_boxcars
           - os: windows-latest
-            artifact-name: windows-dist
+            artifact-name: windows-binary
             cli-path: analyzerl_boxcars/target/release/analyzerl_boxcars.exe
     runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Set up Python
-        if: runner.os == 'Windows'
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
 
       - name: Set up Rust
         if: runner.os == 'Windows'
@@ -54,6 +48,66 @@ jobs:
         shell: bash
         run: test -f "${{ matrix.cli-path }}"
 
+      - name: Build Linux bundled parser binary
+        if: runner.os == 'Linux'
+        run: |
+          rm -rf analyzerl_boxcars/target
+          docker run --rm -v "$PWD:/io" -w /io quay.io/pypa/manylinux_2_28_x86_64 /bin/bash -lc "\
+            curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal && \
+            source ~/.cargo/env && \
+            cargo build --release --manifest-path analyzerl_boxcars/Cargo.toml && \
+            test -x analyzerl_boxcars/target/release/analyzerl_boxcars"
+
+      - name: Upload bundled parser binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact-name }}
+          path: ${{ matrix.cli-path }}
+
+  build-wheel:
+    needs: build-binary
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            binary-artifact: linux-binary
+            dist-artifact: linux-dist
+            cli-path: analyzerl_boxcars/target/release/analyzerl_boxcars
+          - os: windows-latest
+            binary-artifact: windows-binary
+            dist-artifact: windows-dist
+            cli-path: analyzerl_boxcars/target/release/analyzerl_boxcars.exe
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download bundled parser binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.binary-artifact }}
+          path: analyzerl_boxcars/target/release
+
+      - name: Prepare Linux bundled parser binary
+        if: runner.os == 'Linux'
+        run: chmod +x analyzerl_boxcars/target/release/analyzerl_boxcars
+
+      - name: Verify bundled parser binary
+        shell: bash
+        run: test -f "${{ matrix.cli-path }}"
+
+      - name: Set up Python
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Rust
+        if: runner.os == 'Windows'
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Build Windows wheel
         if: runner.os == 'Windows'
         run: |
@@ -66,19 +120,18 @@ jobs:
       - name: Build Linux manylinux wheel
         if: runner.os == 'Linux'
         run: |
-          rm -rf dist analyzerl_boxcars/target
           docker run --rm -v "$PWD:/io" -w /io quay.io/pypa/manylinux_2_28_x86_64 /bin/bash -lc "\
             curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal && \
             source ~/.cargo/env && \
+            test -x analyzerl_boxcars/target/release/analyzerl_boxcars && \
             /opt/python/cp310-cp310/bin/python -m pip install maturin twine && \
-            cargo build --release --manifest-path analyzerl_boxcars/Cargo.toml && \
             /opt/python/cp310-cp310/bin/python -m maturin build --release --out dist --interpreter /opt/python/cp310-cp310/bin/python && \
             /opt/python/cp310-cp310/bin/python -m twine check dist/*.whl"
 
       - name: Upload distribution artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact-name }}
+          name: ${{ matrix.dist-artifact }}
           path: dist/*
 
   sdist:
@@ -107,7 +160,7 @@ jobs:
           path: dist/*
 
   pypi:
-    needs: [build, sdist]
+    needs: [build-wheel, sdist]
     runs-on: ubuntu-latest
     if: |
       github.event_name == 'push' ||
@@ -152,8 +205,8 @@ jobs:
           packages-dir: dist
 
   docs-build:
-    needs: [build]
-    if: always() && (needs.build.result == 'success' || needs.build.result == 'skipped')
+    needs: [build-wheel]
+    if: always() && (needs.build-wheel.result == 'success' || needs.build-wheel.result == 'skipped')
     runs-on: ubuntu-latest
 
     steps:

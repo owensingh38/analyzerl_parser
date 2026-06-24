@@ -82,8 +82,8 @@ def calculate_stats(
         group_by: Output grouping columns. Defaults to ``["replay_id",
             "player_id"]``.
         rates: Whether to add per-five-minute and per-game rate columns.
-        workers: Number of Rust parser workers to use when replay inputs need
-            parsing.
+        workers: Number of parallel stats workers, also passed to the Rust
+            parser when replay inputs need parsing.
         parse_export: Output folder for generated PBP Parquet files when
             replay inputs need parsing.
         force: Whether to overwrite existing parser exports for replay inputs.

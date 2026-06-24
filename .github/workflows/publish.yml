@@ -135,6 +135,7 @@ jobs:
           path: dist/*
 
   sdist:
+    needs: build-binary
     runs-on: ubuntu-latest
 
     steps:

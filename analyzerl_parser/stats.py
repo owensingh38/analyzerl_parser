@@ -1,5 +1,6 @@
 """Player-level replay stat aggregation for parsed AnalyzeRL data."""
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from os import PathLike
 from typing import Any, Literal, Sequence
 
@@ -11,7 +12,11 @@ DATA_SUFFIXES = {".csv", ".parquet"}
 REPLAY_SUFFIX = ".replay"
 CSV_NULL_VALUES = ["", "NA", "NaN", "None", "null"]
 DEFAULT_GROUP_BY = ["replay_id", "player_id"]
-STATS_FILE_BATCH_SIZE = 250
+STATS_FILE_BATCH_SIZE = 64
+STATS_BATCH_BYTES = 64 * 1024 * 1024
+FIELD_THIRD_Y = 5120.0 / 3.0
+CROSSBAR_HEIGHT = 642.775
+GROUND_HEIGHT = 20.0
 
 PLAYER_SLOTS = [
     "blue_player_1",
@@ -20,6 +25,33 @@ PLAYER_SLOTS = [
     "orange_player_1",
     "orange_player_2",
     "orange_player_3",
+]
+
+FRAME_TIME_COLUMNS = [
+    "time_zero_boost",
+    "time_full_boost",
+    "time_zero_to_quarter_boost",
+    "time_quarter_to_half_boost",
+    "time_half_to_three_quarters_boost",
+    "time_three_quarters_to_full_boost",
+    "time_offensive_third",
+    "time_neutral_third",
+    "time_defensive_third",
+    "time_low_air",
+    "time_high_air",
+    "time_ground",
+    "time_possession",
+    "time_holding_powerslide",
+    "time_holding_boost",
+    "time_wasting_boost",
+]
+
+FRAME_VALUE_COLUMNS = [
+    "distance_traveled",
+    "avg_speed",
+    "max_speed",
+    "powerslide_presses",
+    "boost_amount_wasted",
 ]
 
 IDENTITY_COLUMNS = [
@@ -87,10 +119,19 @@ def requested_columns(
         "event_player_2_name",
         "event_player_2_team",
         "frame_number",
+        "frame_has_event",
         "seconds_elapsed",
         "delta",
         "event_length",
+        "official_shot",
+        "official_goal",
         "official_assist",
+        "official_save",
+        "official_shot_count",
+        "official_goal_count",
+        "official_assist_count",
+        "official_save_count",
+        "controlled",
         "boost_pickup_amount",
         "boost_pickup_type",
         "off_demo",
@@ -133,6 +174,16 @@ def requested_columns(
             "is_bot",
             "time_in_game",
             "pos_x",
+            "pos_y",
+            "pos_z",
+            "vel_x",
+            "vel_y",
+            "vel_z",
+            "boost",
+            "boost_active",
+            "handbrake",
+            "supersonic",
+            "distance_to_ball",
         ]:
             columns.append(f"{slot}_{field}")
 
@@ -421,12 +472,94 @@ def flag_col(column):
     return string_col(column).str.to_lowercase().is_in(["true", "1", "yes"])
 
 
+def shot_event_expr() -> pl.Expr:
+    event_type = string_col("event_type")
+    return event_type.is_in(["shot", "goal"])
+
+
+def goal_event_expr() -> pl.Expr:
+    return string_col("event_type") == "goal"
+
+
+def touch_event_expr() -> pl.Expr:
+    non_goal_touch_types = [value for value in TOUCH_EVENT_TYPES if value != "goal"]
+    return string_col("event_type").is_in(non_goal_touch_types) | goal_event_expr()
+
+
+def boost_pad_expr() -> pl.Expr:
+    """Return the rows representing actual small or big boost-pad pickups."""
+    return (string_col("event_type") == "boost-pickup") & string_col(
+        "boost_pickup_type"
+    ).is_in(["small", "big"])
+
+
+def scaled_boost_pickup_amount_expr() -> pl.Expr:
+    """Return boost-pad value in the standard 0-100 boost scale."""
+    pickup_type = string_col("boost_pickup_type")
+    return (
+        pl.when(pickup_type == "small")
+        .then(12.0)
+        .when(pickup_type == "big")
+        .then(100.0)
+        .otherwise(0.0)
+    )
+
+
+def event_player_position_y_expr() -> pl.Expr:
+    """Find the primary event player's y position from the matching frame slot."""
+    player_id = string_col("event_player_1_id")
+    return pl.coalesce(
+        [
+            pl.when(player_id == string_col(f"{slot}_id"))
+            .then(pl.col(f"{slot}_pos_y").cast(pl.Float64, strict=False))
+            .otherwise(None)
+            for slot in PLAYER_SLOTS
+        ]
+    )
+
+
+def boost_zone_exprs() -> tuple[pl.Expr, pl.Expr]:
+    """Return stolen and protected pad conditions from team-relative thirds."""
+    team = string_col("event_team")
+    position_y = event_player_position_y_expr()
+    stolen = ((team == "blue") & (position_y > FIELD_THIRD_Y)) | (
+        (team == "orange") & (position_y < -FIELD_THIRD_Y)
+    )
+    protected = ((team == "blue") & (position_y < -FIELD_THIRD_Y)) | (
+        (team == "orange") & (position_y > FIELD_THIRD_Y)
+    )
+    return stolen, protected
+
+
 def count_if(condition, name):
     return condition.cast(pl.Int64).sum().alias(name)
 
 
 def sum_if(condition, value, name):
     return pl.when(condition).then(value).otherwise(0.0).sum().alias(name)
+
+
+def official_stat_count(stat_type, fallback_condition, name, condition=None):
+    """Prefer replay-recorded stat totals while supporting older parsed inputs."""
+    official = flag_col(f"official_{stat_type}")
+    recorded_count = number_col(f"official_{stat_type}_count")
+    scope = pl.lit(True) if condition is None else condition
+    scoped_official = official & scope
+    recorded_total = (
+        pl.when(scoped_official)
+        .then(pl.when(recorded_count > 0).then(recorded_count).otherwise(1.0))
+        .otherwise(0.0)
+        .sum()
+    )
+    fallback_total = (fallback_condition & scope).cast(pl.Int64).sum()
+
+    return (
+        pl.when(official.any())
+        .then(recorded_total)
+        .otherwise(fallback_total)
+        .cast(pl.Int64)
+        .alias(name)
+    )
 
 
 def time_in_game_seconds_expr() -> pl.Expr:
@@ -490,6 +623,13 @@ def player_slot_rows(events, slot, *, include_inactive: bool = False):
                 string_col("event_team").alias("event_team"),
                 string_col("event_player_1_id").alias("event_player_1_id"),
                 string_col("event_player_2_id").alias("event_player_2_id"),
+                flag_col("official_shot").alias("official_shot"),
+                flag_col("official_goal").alias("official_goal"),
+                flag_col("official_save").alias("official_save"),
+                number_col("official_shot_count").alias("official_shot_count"),
+                number_col("official_goal_count").alias("official_goal_count"),
+                number_col("official_save_count").alias("official_save_count"),
+                flag_col("controlled").alias("controlled"),
                 number_col("xG").alias("xG"),
                 string_col(team_name_col).alias("team_name"),
                 string_col(f"{slot}_platform").alias("platform"),
@@ -509,6 +649,24 @@ def player_slot_rows(events, slot, *, include_inactive: bool = False):
                 number_col("seconds_elapsed").alias("seconds_elapsed"),
                 number_col("event_length").alias("event_length"),
                 number_col("_stats_frame_delta_seconds").alias("frame_delta_seconds"),
+                number_col(f"{slot}_boost").alias("boost"),
+                flag_col(f"{slot}_boost_active").alias("boost_active"),
+                flag_col(f"{slot}_handbrake").alias("handbrake"),
+                flag_col(f"{slot}_supersonic").alias("supersonic"),
+                number_col(f"{slot}_pos_x").alias("pos_x"),
+                number_col(f"{slot}_pos_y").alias("pos_y"),
+                number_col(f"{slot}_pos_z").alias("pos_z"),
+                number_col(f"{slot}_vel_x").alias("vel_x"),
+                number_col(f"{slot}_vel_y").alias("vel_y"),
+                number_col(f"{slot}_vel_z").alias("vel_z"),
+                number_col(f"{slot}_distance_to_ball").alias("distance_to_ball"),
+                pl.min_horizontal(
+                    [
+                        pl.col(f"{other_slot}_distance_to_ball")
+                        .cast(pl.Float64, strict=False)
+                        for other_slot in PLAYER_SLOTS
+                    ]
+                ).alias("nearest_distance_to_ball"),
                 (string_col("event_type") != "").alias("_is_event_row"),
             ]
         )
@@ -647,7 +805,124 @@ def player_slot_rows(events, slot, *, include_inactive: bool = False):
 
 def player_slot_frame(events, slot):
     rows = player_slot_rows(events, slot, include_inactive=True)
-    active_rows = rows.filter(pl.col("_active_on_row"))
+    active_rows = (
+        rows.filter(pl.col("_active_on_row"))
+        .with_columns(
+            [
+                (
+                    pl.col("vel_x").pow(2)
+                    + pl.col("vel_y").pow(2)
+                    + pl.col("vel_z").pow(2)
+                )
+                .sqrt()
+                .alias("_speed"),
+                (
+                    (pl.col("pos_x") - pl.col("pos_x").shift(1)).pow(2)
+                    + (pl.col("pos_y") - pl.col("pos_y").shift(1)).pow(2)
+                    + (pl.col("pos_z") - pl.col("pos_z").shift(1)).pow(2)
+                )
+                .sqrt()
+                .fill_null(0.0)
+                .alias("_distance_traveled"),
+                (
+                    pl.col("handbrake")
+                    & ~pl.col("handbrake").shift(1).fill_null(False)
+                ).alias("_powerslide_pressed"),
+                (pl.col("boost").shift(1) - pl.col("boost"))
+                .clip(lower_bound=0.0)
+                .fill_null(0.0)
+                .alias("_boost_used"),
+            ]
+        )
+    )
+    boost = pl.col("boost")
+    position_y = pl.col("pos_y")
+    position_z = pl.col("pos_z")
+    frame_seconds = pl.col("frame_delta_seconds")
+    team = "orange" if slot.startswith("orange") else "blue"
+    offensive_third = (
+        position_y < -FIELD_THIRD_Y
+        if team == "orange"
+        else position_y > FIELD_THIRD_Y
+    )
+    defensive_third = (
+        position_y > FIELD_THIRD_Y
+        if team == "orange"
+        else position_y < -FIELD_THIRD_Y
+    )
+    neutral_third = position_y.abs() <= FIELD_THIRD_Y
+    possession = (
+        pl.col("nearest_distance_to_ball").is_not_null()
+        & (
+            (pl.col("distance_to_ball") - pl.col("nearest_distance_to_ball")).abs()
+            <= 0.001
+        )
+    )
+
+    def frame_time_minutes(condition: pl.Expr, name: str) -> pl.Expr:
+        return (
+            pl.when(condition)
+            .then(frame_seconds)
+            .otherwise(0.0)
+            .sum()
+            .truediv(60.0)
+            .alias(name)
+        )
+
+    frame_time_stats = [
+        frame_time_minutes(boost <= 0.0, "time_zero_boost"),
+        frame_time_minutes(boost >= 100.0, "time_full_boost"),
+        frame_time_minutes(
+            (boost > 0.0) & (boost < 25.0),
+            "time_zero_to_quarter_boost",
+        ),
+        frame_time_minutes(
+            (boost >= 25.0) & (boost < 50.0),
+            "time_quarter_to_half_boost",
+        ),
+        frame_time_minutes(
+            (boost >= 50.0) & (boost < 75.0),
+            "time_half_to_three_quarters_boost",
+        ),
+        frame_time_minutes(
+            (boost >= 75.0) & (boost < 100.0),
+            "time_three_quarters_to_full_boost",
+        ),
+        frame_time_minutes(offensive_third, "time_offensive_third"),
+        frame_time_minutes(neutral_third, "time_neutral_third"),
+        frame_time_minutes(defensive_third, "time_defensive_third"),
+        frame_time_minutes(
+            (position_z > GROUND_HEIGHT) & (position_z < CROSSBAR_HEIGHT),
+            "time_low_air",
+        ),
+        frame_time_minutes(position_z >= CROSSBAR_HEIGHT, "time_high_air"),
+        frame_time_minutes(position_z <= GROUND_HEIGHT, "time_ground"),
+        frame_time_minutes(possession, "time_possession"),
+        frame_time_minutes(pl.col("handbrake"), "time_holding_powerslide"),
+        frame_time_minutes(pl.col("boost_active"), "time_holding_boost"),
+        frame_time_minutes(
+            pl.col("boost_active") & pl.col("supersonic"),
+            "time_wasting_boost",
+        ),
+    ]
+    total_frame_seconds = pl.col("frame_delta_seconds").sum()
+    frame_value_stats = [
+        pl.col("_distance_traveled").sum().alias("distance_traveled"),
+        pl.when(total_frame_seconds > 0)
+        .then(
+            (pl.col("_speed") * pl.col("frame_delta_seconds")).sum()
+            / total_frame_seconds
+        )
+        .otherwise(0.0)
+        .alias("avg_speed"),
+        pl.col("_speed").max().fill_null(0.0).alias("max_speed"),
+        pl.col("_powerslide_pressed").sum().alias("powerslide_presses"),
+        pl.when(pl.col("boost_active") & pl.col("supersonic"))
+        .then(pl.col("_boost_used"))
+        .otherwise(0.0)
+        .sum()
+        .alias("boost_amount_wasted"),
+    ]
 
     presence_time = (
         rows.filter(pl.col("_slot_has_presence_events") & pl.col("_presence_state").is_not_null())
@@ -719,6 +994,8 @@ def player_slot_frame(events, slot):
                 pl.len().alias("_row_count"),
                 pl.col("_is_event_row").sum().alias("_event_row_count"),
             ]
+            + frame_time_stats
+            + frame_value_stats
         )
         .join(presence_time, on=["replay_id", "player_id"], how="left")
         .with_columns(number_col("_presence_time_seconds").alias("_presence_time_seconds"))
@@ -835,6 +1112,10 @@ def event_presence_player_frame(events):
             pl.lit(0.0).alias("_frame_time_seconds"),
             pl.len().alias("_row_count"),
             pl.len().alias("_event_row_count"),
+        ]
+        + [pl.lit(0.0).alias(column) for column in FRAME_TIME_COLUMNS]
+        + [pl.lit(0.0).alias(column) for column in FRAME_VALUE_COLUMNS]
+        + [
             pl.when(pl.col("_presence_state") == 1)
             .then(pl.col("_presence_interval_seconds"))
             .otherwise(0.0)
@@ -876,6 +1157,16 @@ def player_frame(rows):
             pl.col("_frame_time_seconds").max(),
             pl.col("_row_count").max(),
             pl.col("_event_row_count").max(),
+        ]
+        + [pl.col(column).sum().alias(column) for column in FRAME_TIME_COLUMNS]
+        + [
+            pl.col(column).sum().alias(column)
+            for column in FRAME_VALUE_COLUMNS
+            if column not in {"avg_speed", "max_speed"}
+        ]
+        + [
+            pl.col("avg_speed").max().alias("avg_speed"),
+            pl.col("max_speed").max().alias("max_speed"),
         ]
     )
 
@@ -928,8 +1219,17 @@ def player_frame(rows):
 
 
 def primary_event_stats(events, has_xg):
-    shot = pl.col("event_type").is_in(["shot", "goal"])
-    goal = pl.col("event_type") == "goal"
+    shot = shot_event_expr()
+    goal = goal_event_expr()
+    touch = touch_event_expr()
+    boost_pad = boost_pad_expr()
+    small_boost = boost_pad & (string_col("boost_pickup_type") == "small")
+    big_boost = boost_pad & (string_col("boost_pickup_type") == "big")
+    boost_amount = scaled_boost_pickup_amount_expr()
+    boost_stolen, boost_protected = boost_zone_exprs()
+    entry = string_col("event_type") == "entry"
+    exit_event = string_col("event_type") == "exit"
+    controlled = flag_col("controlled")
     shot_breakdowns = [
         ("off_demo", flag_col("off_demo")),
         ("off_kickoff", flag_col("off_kickoff")),
@@ -951,10 +1251,10 @@ def primary_event_stats(events, has_xg):
     ]
 
     expressions = [
-        count_if(shot, "shots"),
-        count_if(goal, "goals"),
-        count_if(pl.col("event_type") == "save", "saves"),
-        count_if(pl.col("event_type").is_in(TOUCH_EVENT_TYPES), "touches"),
+        official_stat_count("shot", shot, "_recorded_shots"),
+        official_stat_count("goal", goal, "goals"),
+        official_stat_count("save", pl.col("event_type") == "save", "saves"),
+        count_if(touch, "touches"),
         count_if(pl.col("event_type") == "pass", "passes"),
         count_if(pl.col("event_type") == "turnover", "turnovers"),
         count_if(pl.col("event_type") == "challenge", "challenge_wins"),
@@ -963,28 +1263,53 @@ def primary_event_stats(events, has_xg):
         count_if(pl.col("event_type") == "press", "presses"),
         count_if(pl.col("event_type") == "demo", "demos_applied"),
         count_if(pl.col("event_type") == "bump", "bumps"),
-        count_if(pl.col("event_type") == "entry", "entries"),
-        count_if(pl.col("event_type") == "exit", "exits"),
+        count_if(entry, "entries"),
+        count_if(entry & controlled, "controlled_entries"),
+        count_if(entry & ~controlled, "uncontrolled_entries"),
+        count_if(exit_event, "exits"),
+        count_if(exit_event & controlled, "controlled_exits"),
+        count_if(exit_event & ~controlled, "uncontrolled_exits"),
         count_if(pl.col("event_type") == "retrieval", "retrievals"),
         count_if(pl.col("event_type").is_in(["air-dribble", "air_dribble"]), "air_dribbles"),
         count_if(pl.col("event_type").is_in(["ground-dribble", "ground_dribble"]), "ground_dribbles"),
         count_if(pl.col("event_type") == "flick", "flicks"),
         count_if(pl.col("event_type") == "flip-reset", "flip_resets"),
-        count_if(pl.col("event_type") == "boost-pickup", "boost_pickups"),
-        count_if(
-            (pl.col("event_type") == "boost-pickup")
-            & (string_col("boost_pickup_type") == "small"),
-            "small_boost_pickups",
-        ),
-        count_if(
-            (pl.col("event_type") == "boost-pickup")
-            & (string_col("boost_pickup_type") == "big"),
-            "big_boost_pickups",
+        count_if(boost_pad, "boost_pickups"),
+        count_if(small_boost, "small_boost_pickups"),
+        count_if(big_boost, "big_boost_pickups"),
+        count_if(boost_pad, "boost_pads_collected"),
+        count_if(small_boost, "small_boost_pads_collected"),
+        count_if(big_boost, "big_boost_pads_collected"),
+        sum_if(boost_pad, boost_amount, "boost_collected"),
+        sum_if(small_boost, boost_amount, "small_boost_amount_collected"),
+        sum_if(big_boost, boost_amount, "big_boost_amount_collected"),
+        count_if(boost_pad & boost_stolen, "boost_pads_stolen"),
+        count_if(small_boost & boost_stolen, "small_boost_pads_stolen"),
+        count_if(big_boost & boost_stolen, "big_boost_pads_stolen"),
+        sum_if(boost_pad & boost_stolen, boost_amount, "boost_amount_stolen"),
+        sum_if(
+            small_boost & boost_stolen,
+            boost_amount,
+            "small_boost_amount_stolen",
         ),
         sum_if(
-            pl.col("event_type") == "boost-pickup",
-            number_col("boost_pickup_amount"),
-            "boost_collected",
+            big_boost & boost_stolen,
+            boost_amount,
+            "big_boost_amount_stolen",
+        ),
+        count_if(boost_pad & boost_protected, "boost_pads_protected"),
+        count_if(small_boost & boost_protected, "small_boost_pads_protected"),
+        count_if(big_boost & boost_protected, "big_boost_pads_protected"),
+        sum_if(boost_pad & boost_protected, boost_amount, "boost_amount_protected"),
+        sum_if(
+            small_boost & boost_protected,
+            boost_amount,
+            "small_boost_amount_protected",
+        ),
+        sum_if(
+            big_boost & boost_protected,
+            boost_amount,
+            "big_boost_amount_protected",
         ),
     ]
     expressions.extend(
@@ -1013,17 +1338,21 @@ def primary_event_stats(events, has_xg):
             ]
         )
         .agg(expressions)
+        .with_columns(
+            pl.max_horizontal("_recorded_shots", "goals").alias("shots")
+        )
+        .drop("_recorded_shots")
     )
 
 
 def secondary_event_stats(events, has_xg):
-    assist = (pl.col("event_type") == "goal") & (
+    assist = goal_event_expr() & (
         flag_col("official_assist") | (string_col("event_player_2_id") != "")
     )
-    shot = pl.col("event_type").is_in(["shot", "goal"])
+    shot = shot_event_expr()
 
     expressions = [
-        count_if(assist, "assists"),
+        official_stat_count("assist", assist, "assists"),
         count_if(shot, "shot_assists"),
         count_if(pl.col("event_type") == "pass", "passes_received"),
         count_if(pl.col("event_type") == "demo", "demos_taken"),
@@ -1061,17 +1390,24 @@ def active_player_team_event_stats(rows, has_xg):
         & string_col("event_team").is_in(["blue", "orange"])
     )
 
-    shot = pl.col("event_type").is_in(["shot", "goal"])
-    goal = pl.col("event_type") == "goal"
+    shot = shot_event_expr()
+    goal = goal_event_expr()
     same_team = pl.col("event_team") == pl.col("team")
     opposing_team = pl.col("event_team") != pl.col("team")
     active = pl.col("_active_for_event_context")
+    controlled = flag_col("controlled")
+    entry = pl.col("event_type") == "entry"
+    exit_event = pl.col("event_type") == "exit"
 
     expressions = [
-        count_if(active & shot & same_team, "shots_for"),
-        count_if(active & shot & opposing_team, "shots_against"),
-        count_if(active & goal & same_team, "goals_for"),
-        count_if(active & goal & opposing_team, "goals_against"),
+        official_stat_count(
+            "shot", shot, "_recorded_shots_for", active & same_team
+        ),
+        official_stat_count(
+            "shot", shot, "_recorded_shots_against", active & opposing_team
+        ),
+        official_stat_count("goal", goal, "goals_for", active & same_team),
+        official_stat_count("goal", goal, "goals_against", active & opposing_team),
         count_if(
             active & (pl.col("event_type") == "demo") & same_team,
             "demos_applied_for",
@@ -1080,10 +1416,18 @@ def active_player_team_event_stats(rows, has_xg):
             active & (pl.col("event_type") == "demo") & opposing_team,
             "demos_taken_against",
         ),
-        count_if(active & (pl.col("event_type") == "entry") & same_team, "entries_for"),
-        count_if(active & (pl.col("event_type") == "entry") & opposing_team, "entries_against"),
-        count_if(active & (pl.col("event_type") == "exit") & same_team, "exits_for"),
-        count_if(active & (pl.col("event_type") == "exit") & opposing_team, "exits_against"),
+        count_if(active & entry & same_team, "entries_for"),
+        count_if(active & entry & controlled & same_team, "controlled_entries_for"),
+        count_if(active & entry & ~controlled & same_team, "uncontrolled_entries_for"),
+        count_if(active & entry & opposing_team, "entries_against"),
+        count_if(active & entry & controlled & opposing_team, "controlled_entries_against"),
+        count_if(active & entry & ~controlled & opposing_team, "uncontrolled_entries_against"),
+        count_if(active & exit_event & same_team, "exits_for"),
+        count_if(active & exit_event & controlled & same_team, "controlled_exits_for"),
+        count_if(active & exit_event & ~controlled & same_team, "uncontrolled_exits_for"),
+        count_if(active & exit_event & opposing_team, "exits_against"),
+        count_if(active & exit_event & controlled & opposing_team, "controlled_exits_against"),
+        count_if(active & exit_event & ~controlled & opposing_team, "uncontrolled_exits_against"),
     ]
 
     if has_xg:
@@ -1095,7 +1439,21 @@ def active_player_team_event_stats(rows, has_xg):
             ]
         )
 
-    return active_events.group_by(["replay_id", "player_id"]).agg(expressions)
+    return (
+        active_events.group_by(["replay_id", "player_id"])
+        .agg(expressions)
+        .with_columns(
+            [
+                pl.max_horizontal("_recorded_shots_for", "goals_for").alias(
+                    "shots_for"
+                ),
+                pl.max_horizontal(
+                    "_recorded_shots_against", "goals_against"
+                ).alias("shots_against"),
+            ]
+        )
+        .drop(["_recorded_shots_for", "_recorded_shots_against"])
+    )
 
 
 def normalize_group_by(group_by: Sequence[str] | str | None) -> list[str]:
@@ -1175,11 +1533,26 @@ def aggregate_stats(
         for column in columns
         if column not in IDENTITY_COLUMNS and column not in DERIVED_XG_COLUMNS
     ]
+    special_metric_columns = {"avg_speed", "max_speed"}
     aggregations = [
         pl.col(column).sum().alias(column)
         for column in metric_columns
-        if column not in group_columns and column != "games_played"
+        if column not in group_columns
+        and column != "games_played"
+        and column not in special_metric_columns
     ]
+    if "avg_speed" in metric_columns and "avg_speed" not in group_columns:
+        aggregations.append(
+            pl.when(pl.col("time_on_field").sum() > 0)
+            .then(
+                (pl.col("avg_speed") * pl.col("time_on_field")).sum()
+                / pl.col("time_on_field").sum()
+            )
+            .otherwise(0.0)
+            .alias("avg_speed")
+        )
+    if "max_speed" in metric_columns and "max_speed" not in group_columns:
+        aggregations.append(pl.col("max_speed").max().alias("max_speed"))
     if "games_played" in columns and "games_played" not in group_columns:
         if "replay_id" in columns:
             aggregations.append(pl.col("replay_id").n_unique().alias("games_played"))
@@ -1269,6 +1642,15 @@ def finish_stats(
         stats = add_rate_stats(stats)
 
     stats = stats.collect() if isinstance(stats, pl.LazyFrame) else stats
+    float_columns = [
+        column
+        for column, dtype in stats.schema.items()
+        if dtype in {pl.Float32, pl.Float64}
+    ]
+    if float_columns:
+        stats = stats.with_columns(
+            [pl.col(column).round(12) for column in float_columns]
+        )
     sort_columns = [
         column
         for column in ["replay_id", "team", "player_name", "player_id"]
@@ -1291,6 +1673,7 @@ def calculate_stats_from_lazy_rows(
         rows = apply_xg_to_pbp(rows, xg_model_path).lazy()
 
     schema = rows.collect_schema().names()
+    has_frame_data = "frame_has_event" in schema
 
     has_xg = "xG" in schema
     columns = requested_columns(has_xg, extra_columns=xg_columns)
@@ -1320,7 +1703,7 @@ def calculate_stats_from_lazy_rows(
         .item()
     )
 
-    if has_presence_events:
+    if has_presence_events and not has_frame_data:
         rows = rows.with_columns(
             pl.lit(None, dtype=pl.Float64).alias("_stats_frame_delta_seconds")
         )
@@ -1367,7 +1750,7 @@ def calculate_stats_from_path_batches(
     limit: int | None,
     xg_model_path: str | PathLike[str] | None,
     xg_columns: Sequence[str] | None,
-) -> pl.DataFrame | None:
+) -> pl.DataFrame:
     replay_inputs, tabular_inputs = _split_path_inputs(frames)
 
     if replay_inputs:
@@ -1383,21 +1766,91 @@ def calculate_stats_from_path_batches(
     elif limit is not None:
         tabular_inputs = tabular_inputs[:limit]
 
-    if len(tabular_inputs) <= STATS_FILE_BATCH_SIZE:
-        return None
+    requested_workers = max(int(workers or 1), 1)
+    files_per_batch = max(
+        1,
+        min(
+            STATS_FILE_BATCH_SIZE,
+            (len(tabular_inputs) + requested_workers - 1) // requested_workers,
+        ),
+    )
+    bytes_per_batch = max(STATS_BATCH_BYTES // requested_workers, 8 * 1024 * 1024)
+    batches: list[list[Path]] = []
+    batch: list[Path] = []
+    batch_bytes = 0
+    for path in tabular_inputs:
+        try:
+            path_bytes = path.stat().st_size
+        except OSError:
+            path_bytes = 0
 
-    partials = []
-    for start in range(0, len(tabular_inputs), STATS_FILE_BATCH_SIZE):
-        batch = tabular_inputs[start : start + STATS_FILE_BATCH_SIZE]
-        rows = _lazy_scan_files(batch, extra_columns=xg_columns)
-        partials.append(
-            calculate_stats_from_lazy_rows(
-                rows,
-                group_by=DEFAULT_GROUP_BY,
-                rates=False,
-                xg_model_path=xg_model_path,
-                xg_columns=xg_columns,
+        exceeds_limit = batch and (
+            len(batch) >= files_per_batch
+            or batch_bytes + path_bytes > bytes_per_batch
+        )
+        if exceeds_limit:
+            batches.append(batch)
+            batch = []
+            batch_bytes = 0
+
+        batch.append(path)
+        batch_bytes += path_bytes
+
+    if batch:
+        batches.append(batch)
+
+    def build_batch(batch_paths: list[Path]) -> pl.DataFrame:
+        rows = _lazy_scan_files(batch_paths, extra_columns=xg_columns)
+        return calculate_stats_from_lazy_rows(
+            rows,
+            group_by=DEFAULT_GROUP_BY,
+            rates=False,
+            xg_model_path=xg_model_path,
+            xg_columns=xg_columns,
+        )
+
+    total = len(tabular_inputs)
+    done = 0
+    partials_by_index: dict[int, pl.DataFrame] = {}
+    max_workers = min(requested_workers, len(batches))
+
+    def show_batch_progress(batch_paths: list[Path]) -> None:
+        nonlocal done
+        for path in batch_paths:
+            done += 1
+            replay_id = path.stem.removesuffix("_pbp").removesuffix("_frames")
+            print(
+                f"\r\x1b[2Kbuilt stats {replay_id} ({done}/{total})",
+                end="",
+                flush=True,
             )
+
+    try:
+        if max_workers == 1:
+            for index, batch_paths in enumerate(batches):
+                partials_by_index[index] = build_batch(batch_paths)
+                show_batch_progress(batch_paths)
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(build_batch, batch_paths): (index, batch_paths)
+                    for index, batch_paths in enumerate(batches)
+                }
+                for future in as_completed(futures):
+                    index, batch_paths = futures[future]
+                    partials_by_index[index] = future.result()
+                    show_batch_progress(batch_paths)
+    finally:
+        if done:
+            print(flush=True)
+
+    partials = [partials_by_index[index] for index in range(len(batches))]
+    if len(partials) == 1:
+        return finish_stats(
+            partials[0].lazy(),
+            group_by=group_by,
+            rates=rates,
+            has_xg="expected_goals" in partials[0].columns,
         )
 
     combined = pl.concat(partials, how="vertical_relaxed").lazy()
@@ -1424,8 +1877,8 @@ def calculate_player_replay_stats(
         group_by: Output grouping columns. Defaults to one row per replay and
             player.
         rates: Whether to add per-five-minute and per-game rate columns.
-        workers: Number of Rust parser workers to use when replay inputs need
-            parsing.
+        workers: Number of parallel stats workers, also passed to the Rust
+            parser when replay inputs need parsing.
         parse_export: Output folder for generated PBP Parquet files when
             replay inputs need parsing.
         force: Whether to overwrite existing parser exports for replay inputs.
@@ -1502,8 +1955,8 @@ def calculate_stats(
         group_by: Output grouping columns. Defaults to ``["replay_id",
             "player_id"]``.
         rates: Whether to add per-five-minute and per-game rate columns.
-        workers: Number of Rust parser workers to use when replay inputs need
-            parsing.
+        workers: Number of parallel stats workers, also passed to the Rust
+            parser when replay inputs need parsing.
         parse_export: Output folder for generated PBP Parquet files when
             replay inputs need parsing.
         force: Whether to overwrite existing parser exports for replay inputs.

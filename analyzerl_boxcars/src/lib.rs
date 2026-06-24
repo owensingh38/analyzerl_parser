@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use arrow_array::{ArrayRef, BooleanArray, Float32Array, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use boxcars::{Attribute, HeaderProp, RemoteId, Replay, UniqueId, UpdatedAttribute};
+use boxcars::{Attribute, CamSettings, HeaderProp, RemoteId, Replay, UniqueId, UpdatedAttribute};
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -368,6 +368,32 @@ struct PlayerInfo {
     time_in_game: String,
     car_id: String,
     car_name: String,
+    camera_settings: Option<PlayerCameraSettings>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PlayerCameraSettings {
+    fov: f32,
+    height: f32,
+    angle: f32,
+    distance: f32,
+    stiffness: f32,
+    swivel: f32,
+    transition: Option<f32>,
+}
+
+impl From<CamSettings> for PlayerCameraSettings {
+    fn from(value: CamSettings) -> Self {
+        Self {
+            fov: value.fov,
+            height: value.height,
+            angle: value.angle,
+            distance: value.distance,
+            stiffness: value.stiffness,
+            swivel: value.swivel,
+            transition: value.transition,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1397,6 +1423,8 @@ pub fn animate_json_command(args: Vec<String>) -> Result<()> {
         .parse()
         .with_context(|| format!("boxcars parsing {}", replay_path.display()))?;
     let context = pbp_context(&replay);
+    let replay_id = header_string(&replay, "Id").unwrap_or_else(|| game_id.clone());
+    let (final_blue_score, final_orange_score) = header_final_score(&replay);
     let pbp_bytes = write_pbp_to_writer(csv::Writer::from_writer(Vec::new()), &game_id, &replay)?;
     let pbp_csv = String::from_utf8(pbp_bytes)?;
     let frames = context
@@ -1408,6 +1436,8 @@ pub fn animate_json_command(args: Vec<String>) -> Result<()> {
                 serde_json::json!({
                     "pos": [state.pos.x, state.pos.y, state.pos.z],
                     "vel": [state.vel.x, state.vel.y, state.vel.z],
+                    "ang_vel": [state.ang_vel.x, state.ang_vel.y, state.ang_vel.z],
+                    "rot": [state.rot.x, state.rot.y, state.rot.z, state.rot.w],
                 })
             });
             let players = context
@@ -1423,9 +1453,16 @@ pub fn animate_json_command(args: Vec<String>) -> Result<()> {
                         "team": team_name(player.team),
                         "pos": [state.entity.pos.x, state.entity.pos.y, state.entity.pos.z],
                         "vel": [state.entity.vel.x, state.entity.vel.y, state.entity.vel.z],
-                        "rot": [state.entity.rot.x, state.entity.rot.y, state.entity.rot.z],
+                        "ang_vel": [state.entity.ang_vel.x, state.entity.ang_vel.y, state.entity.ang_vel.z],
+                        "rot": [state.entity.rot.x, state.entity.rot.y, state.entity.rot.z, state.entity.rot.w],
                         "boost_raw": state.boost,
                         "boost": state.boost.map(|value| boost_units(i32::from(value))),
+                        "boost_active": state.boost_active,
+                        "boost_collect": state.boost_collect,
+                        "throttle": state.throttle,
+                        "steer": state.steer,
+                        "handbrake": state.handbrake,
+                        "ball_cam": state.ball_cam,
                         "dodge_active": state.dodge_active,
                         "jump_active": state.jump_active,
                         "double_jump_active": state.double_jump_active,
@@ -1442,6 +1479,7 @@ pub fn animate_json_command(args: Vec<String>) -> Result<()> {
                 .collect::<Vec<_>>();
             serde_json::json!({
                 "frame_number": snapshot.frame_number,
+                "replay_seconds": snapshot.frame_number as f32 / 30.0,
                 "seconds_elapsed": snapshot.seconds_elapsed,
                 "seconds_remaining": snapshot.seconds_remaining,
                 "ball": ball,
@@ -1451,8 +1489,11 @@ pub fn animate_json_command(args: Vec<String>) -> Result<()> {
         .collect::<Vec<_>>();
     let payload = serde_json::json!({
         "game_id": game_id,
+        "replay_id": replay_id,
         "blue_team_name": context.blue_team_name.clone(),
         "orange_team_name": context.orange_team_name.clone(),
+        "final_blue_score": final_blue_score,
+        "final_orange_score": final_orange_score,
         "frame_step": frame_step,
         "players": context.players.iter().map(|player| {
             serde_json::json!({
@@ -1460,8 +1501,18 @@ pub fn animate_json_command(args: Vec<String>) -> Result<()> {
                 "name": player.name.clone(),
                 "slot": player.slot.clone(),
                 "team": team_name(player.team),
+                "platform": player.platform.clone(),
                 "car_id": player.car_id.clone(),
                 "car_name": player.car_name.clone(),
+                "camera_settings": player.camera_settings.map(|camera| serde_json::json!({
+                    "fov": camera.fov,
+                    "height": camera.height,
+                    "angle": camera.angle,
+                    "distance": camera.distance,
+                    "stiffness": camera.stiffness,
+                    "swivel": camera.swivel,
+                    "transition": camera.transition,
+                })),
             })
         }).collect::<Vec<_>>(),
         "pbp_csv": pbp_csv,
@@ -1469,6 +1520,24 @@ pub fn animate_json_command(args: Vec<String>) -> Result<()> {
     });
     serde_json::to_writer(std::io::stdout(), &payload)?;
     Ok(())
+}
+
+fn header_final_score(replay: &Replay) -> (i32, i32) {
+    let mut blue_score = 0;
+    let mut orange_score = 0;
+
+    if let Some(players) = header_array(replay, "PlayerStats") {
+        for player in players {
+            let goals = prop_i32(player, "Goals").unwrap_or(0);
+            match prop_i32(player, "Team").or_else(|| prop_i32(player, "PlayerTeam")) {
+                Some(1) => orange_score += goals,
+                Some(0) => blue_score += goals,
+                _ => {}
+            }
+        }
+    }
+
+    (blue_score, orange_score)
 }
 
 pub fn inspect_flip_command(args: Vec<String>) -> Result<()> {
@@ -2270,6 +2339,7 @@ fn build_pbp_rows(game_id: &str, replay: &Replay) -> Result<(PbpContext, Vec<Pbp
         team_size,
         &game_time,
     );
+    collapse_duplicate_official_saves(&mut rows);
     sort_pbp_rows(&mut rows);
 
     //Fill default flags and run the remaining row-level feature passes.
@@ -3203,6 +3273,7 @@ fn pbp_players(replay: &Replay) -> Vec<PlayerInfo> {
                 time_in_game: String::new(),
                 car_id: String::new(),
                 car_name: String::new(),
+                camera_settings: None,
             });
         }
     }
@@ -3237,6 +3308,9 @@ fn pbp_context(replay: &Replay) -> PbpContext {
     let mut pri_team_actor: HashMap<i32, i32> = HashMap::new();
     let mut team_actor_number: HashMap<i32, i32> = HashMap::new();
     let mut car_pri: HashMap<i32, i32> = HashMap::new();
+    let mut camera_actor_pri: HashMap<i32, i32> = HashMap::new();
+    let mut pending_camera_settings: HashMap<i32, PlayerCameraSettings> = HashMap::new();
+    let mut camera_settings_by_pri: HashMap<i32, PlayerCameraSettings> = HashMap::new();
     let mut car_player_name: HashMap<i32, String> = HashMap::new();
     let mut component_vehicle: HashMap<i32, i32> = HashMap::new();
     let mut actor_object_name: HashMap<i32, String> = HashMap::new();
@@ -3286,6 +3360,9 @@ fn pbp_context(replay: &Replay) -> PbpContext {
                             &pri_name,
                         ) {
                             player.actor_id = updated_actor.actor_id.0.to_string();
+                            player.camera_settings = camera_settings_by_pri
+                                .get(&updated_actor.actor_id.0)
+                                .copied();
                         }
                         for (car_actor, pri_actor) in &car_pri {
                             if *pri_actor == updated_actor.actor_id.0 {
@@ -3339,6 +3416,54 @@ fn pbp_context(replay: &Replay) -> PbpContext {
                             player.actor_id = updated_actor.actor_id.0.to_string();
                             player.network_id = unique_id_to_network_id(value);
                             player.id = unique_id_to_player_id(value);
+                        }
+                    }
+                    ("TAGame.PRI_TA:CameraSettings", Attribute::CamSettings(value)) => {
+                        if let Some(player) = context_player_mut(
+                            &mut context.players,
+                            updated_actor.actor_id.0,
+                            &pri_name,
+                        ) {
+                            let settings = PlayerCameraSettings::from(**value);
+                            player.camera_settings = Some(settings);
+                            camera_settings_by_pri.insert(updated_actor.actor_id.0, settings);
+                        }
+                    }
+                    ("TAGame.CameraSettingsActor_TA:PRI", Attribute::ActiveActor(value)) => {
+                        if value.active {
+                            camera_actor_pri.insert(updated_actor.actor_id.0, value.actor.0);
+                            if let Some(settings) = pending_camera_settings
+                                .remove(&updated_actor.actor_id.0)
+                            {
+                                camera_settings_by_pri.insert(value.actor.0, settings);
+                                if let Some(player) = context_player_mut(
+                                    &mut context.players,
+                                    value.actor.0,
+                                    &pri_name,
+                                ) {
+                                    player.camera_settings = Some(settings);
+                                }
+                            }
+                        }
+                    }
+                    (
+                        "TAGame.CameraSettingsActor_TA:ProfileSettings",
+                        Attribute::CamSettings(value),
+                    ) => {
+                        let settings = PlayerCameraSettings::from(**value);
+                        if let Some(pri_actor_id) =
+                            camera_actor_pri.get(&updated_actor.actor_id.0).copied()
+                        {
+                            camera_settings_by_pri.insert(pri_actor_id, settings);
+                            if let Some(player) = context_player_mut(
+                                &mut context.players,
+                                pri_actor_id,
+                                &pri_name,
+                            ) {
+                                player.camera_settings = Some(settings);
+                            }
+                        } else {
+                            pending_camera_settings.insert(updated_actor.actor_id.0, settings);
                         }
                     }
                     ("Engine.Pawn:PlayerReplicationInfo", Attribute::ActiveActor(value)) => {
@@ -4443,7 +4568,7 @@ fn kickoff_touch_event_indices(events: &[BallEvent], kickoff_starts: &[i32]) -> 
             .iter()
             .enumerate()
             .filter(|(_, event)| {
-                event.frame_number > start
+                event.frame_number >= start
                     && event.frame_number - start <= POST_GOAL_KICKOFF_WINDOW_FRAMES
             })
             .min_by_key(|(_, event)| event.frame_number);
@@ -4513,7 +4638,7 @@ fn apply_kickoff_boost_resets(frames: &mut [FrameSnapshot], kickoff_starts: &[i3
                     }
                     continue;
                 }
-                state.boost = Some(33);
+                state.boost = Some(raw_boost_units(33));
                 state.boost_collect = None;
                 state.boost_updated_frame = Some(start_frame);
             }
@@ -5258,6 +5383,15 @@ fn reconcile_player_saves(
     while pbp_stat_counts(rows, &player.name).2 < expected {
         let frame = official_touch_candidate_frame(rows, &player.name, "official_save")
             .unwrap_or_else(|| player_first_frame(context, players, &player.name).unwrap_or(0));
+        if let Some(idx) = rows.iter().position(|row| {
+            row.event_type == "save"
+                && row.frame_number == Some(frame)
+                && row_string(&row.values, "event_player_1_name") == player.name
+                && truthy(row.values.get("official_save"))
+        }) {
+            increment_official_count(&mut rows[idx].values, "save");
+            continue;
+        }
         rows.push(build_official_stat_row(
             &OfficialStatEvent {
                 frame_number: frame,
@@ -5276,6 +5410,38 @@ fn reconcile_player_saves(
             game_time,
         ));
     }
+}
+
+fn collapse_duplicate_official_saves(rows: &mut Vec<PbpEventRecord>) {
+    let mut indexes: HashMap<(Option<i32>, String, String, String, String), usize> =
+        HashMap::new();
+    let mut collapsed: Vec<PbpEventRecord> = Vec::with_capacity(rows.len());
+
+    for row in rows.drain(..) {
+        if row.event_type != "save" || !truthy(row.values.get("official_save")) {
+            collapsed.push(row);
+            continue;
+        }
+        let key = (
+            row.frame_number,
+            row_string(&row.values, "recorded_frame_number"),
+            row_string(&row.values, "event_player_1_name"),
+            row_string(&row.values, "event_player_2_name"),
+            row_string(&row.values, "linked_shot_observed_frame_number"),
+        );
+        if let Some(&idx) = indexes.get(&key) {
+            let count = row_i32(&row.values, "official_save_count").unwrap_or(1);
+            let prior = row_i32(&collapsed[idx].values, "official_save_count").unwrap_or(1);
+            collapsed[idx]
+                .values
+                .insert("official_save_count".to_string(), (prior + count).to_string());
+            continue;
+        }
+        indexes.insert(key, collapsed.len());
+        collapsed.push(row);
+    }
+
+    *rows = collapsed;
 }
 
 fn reconcile_player_shots(
@@ -5299,9 +5465,15 @@ fn reconcile_player_shots(
             .filter(|(_, row)| row_string(&row.values, "event_player_1_name") == player.name)
             .filter(|(_, row)| is_ball_touch_row(row))
             .filter(|(_, row)| !truthy(row.values.get("official_shot")))
-            .map(|(idx, row)| (idx, row.frame_number.unwrap_or(i32::MAX)))
-            .min_by_key(|(_, frame)| *frame)
-            .map(|(idx, _)| idx);
+            .map(|(idx, row)| {
+                (
+                    idx,
+                    row.event_type != "goal",
+                    row.frame_number.unwrap_or(i32::MAX),
+                )
+            })
+            .min_by_key(|(_, non_goal, frame)| (*non_goal, *frame))
+            .map(|(idx, _, _)| idx);
         if let Some(idx) = candidate_idx {
             rows[idx]
                 .values
@@ -6145,7 +6317,7 @@ fn add_touch_zone_events(
         } else {
             None
         };
-        let Some((event_type, line_y)) = maybe_event else {
+        let Some((event_type, _line_y)) = maybe_event else {
             continue;
         };
         let key = (event_type, team);
@@ -6163,7 +6335,7 @@ fn add_touch_zone_events(
             Some(event.player_name.as_str()),
             touch_zone_event_controlled(event, context),
             event.ball_state.pos,
-            Some(line_y),
+            None,
             game_id,
             match_guid,
             replay_name,
@@ -6188,7 +6360,8 @@ fn touch_exits_defensive_third(
     }
     next_event
         .map(|next| !in_defensive_third(team, next.ball_state.pos.y, third))
-        .unwrap_or_else(|| moving_out_of_defensive_third(team, event.ball_state.vel.y))
+        .unwrap_or(false)
+        || moving_toward_opponent_half(team, event.ball_state.vel.y)
 }
 
 fn touch_enters_offensive_third(
@@ -6202,7 +6375,8 @@ fn touch_enters_offensive_third(
     }
     next_event
         .map(|next| in_offensive_third(team, next.ball_state.pos.y, third))
-        .unwrap_or_else(|| moving_into_offensive_third(team, event.ball_state.vel.y))
+        .unwrap_or(false)
+        || moving_toward_opponent_half(team, event.ball_state.vel.y)
 }
 
 fn in_defensive_third(team: i32, y: f32, third: f32) -> bool {
@@ -6221,19 +6395,11 @@ fn in_offensive_third(team: i32, y: f32, third: f32) -> bool {
     }
 }
 
-fn moving_out_of_defensive_third(team: i32, vel_y: f32) -> bool {
+fn moving_toward_opponent_half(team: i32, velocity_y: f32) -> bool {
     if team == 1 {
-        vel_y < 0.0
+        velocity_y < 0.0
     } else {
-        vel_y > 0.0
-    }
-}
-
-fn moving_into_offensive_third(team: i32, vel_y: f32) -> bool {
-    if team == 1 {
-        vel_y < 0.0
-    } else {
-        vel_y > 0.0
+        velocity_y > 0.0
     }
 }
 
@@ -7037,6 +7203,10 @@ fn boost_pickup_type(prior_boost: Option<i32>, current_boost: i32, amount: i32) 
 
 fn boost_units(raw_boost: i32) -> i32 {
     ((raw_boost as f32) * 100.0 / 255.0).round() as i32
+}
+
+fn raw_boost_units(scaled_boost: i32) -> u8 {
+    ((scaled_boost as f32) * 255.0 / 100.0).round() as u8
 }
 
 fn post_process_pbp_rows(rows: &mut Vec<PbpEventRecord>, players: &[PlayerInfo]) {

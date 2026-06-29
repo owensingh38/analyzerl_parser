@@ -4,7 +4,7 @@ use std::env;
 use _boxcars::{
     animate_json_command, frames_args, frames_command, index_args, index_command,
     inspect_flip_command, match_guid_args, match_guid_command, match_guids_args,
-    match_guids_command, parse_args, parse_command,
+    match_guids_command, parse_args, parse_command, stats_args, stats_command,
 };
 
 fn main() -> Result<()> {
@@ -13,6 +13,12 @@ fn main() -> Result<()> {
     match args.next().as_deref() {
         Some("parse") => parse_command(parse_args(args.collect())?),
         Some("frames") => frames_command(frames_args(args.collect())?),
+        Some("stats") => stats_command(stats_args(args.collect())?),
+        Some("frames-only") => {
+            let mut args = args.collect::<Vec<_>>();
+            args.push("--frames-only".to_string());
+            frames_command(frames_args(args)?)
+        }
         Some("index") => index_command(index_args(args.collect())?),
         Some("match-guid") => match_guid_command(match_guid_args(args.collect())?),
         Some("match-guids") => match_guids_command(match_guids_args(args.collect())?),

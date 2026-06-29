@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
+use wgpu::util::DeviceExt;
 
 const CAR_CONTACT_DISTANCE: f32 = 225.0;
 const CAR_CONTACT_COOLDOWN_FRAMES: i32 = 15;
@@ -58,6 +59,13 @@ const CEILING_Z: f32 = 2044.0;
 const GOAL_HEIGHT: f32 = 642.775;
 const GOAL_CENTER_TO_POST: f32 = 892.755;
 const GRAVITY: f32 = 650.0;
+const MISSED_SHOT_MAX_LATERAL_MISS: f32 = 2500.0;
+const MISSED_SHOT_MAX_HEIGHT: f32 = 2044.0;
+const MISSED_PASS_PROJECTION_SECONDS: f32 = 2.5;
+const MISSED_PASS_TARGET_RADIUS: f32 = 450.0;
+const MISSED_PASS_MAX_TARGET_MISS: f32 = 1800.0;
+const MISSED_PASS_MIN_SPEED: f32 = 900.0;
+const MISSED_PASS_MIN_FORWARD_DOT: f32 = 0.35;
 const SUPERSONIC_THRESHOLD: f32 = 2200.0;
 const WALL_SHOT_DISTANCE: f32 = 350.0;
 const CEILING_SHOT_DISTANCE: f32 = 350.0;
@@ -67,7 +75,51 @@ const FLIP_RESET_CONTACT_DISTANCE: f32 = 230.0;
 const FLIP_RESET_FRAME_WINDOW: i32 = 30;
 const FLIP_RESET_MIN_CAR_Z: f32 = 120.0;
 const FLIP_RESET_UNDERSIDE_Z: f32 = -25.0;
+const DOUBLE_COMMIT_BALL_DISTANCE: f32 = 1100.0;
+const DOUBLE_COMMIT_TEAMMATE_DISTANCE: f32 = 1300.0;
+const DOUBLE_COMMIT_COOLDOWN_FRAMES: i32 = 45;
+const WHIFF_BALL_DISTANCE: f32 = 285.0;
+const WHIFF_PREVIOUS_BALL_DISTANCE: f32 = 520.0;
+const WHIFF_CROSS_BALL_DISTANCE: f32 = 145.0;
+const WHIFF_MIN_SPEED_TOWARD_BALL: f32 = 800.0;
+const WHIFF_COMMITTED_SPEED_TOWARD_BALL: f32 = 1150.0;
+const WHIFF_TOUCH_EXCLUSION_FRAMES: i32 = 10;
+const WHIFF_ANY_TOUCH_EXCLUSION_FRAMES: i32 = 1;
+const WHIFF_COOLDOWN_FRAMES: i32 = 120;
+const WHIFF_DIRECT_TOUCH_WINDOW_FRAMES: i32 = 90;
+const WHIFF_NEXT_OTHER_TOUCH_WINDOW_FRAMES: i32 = 120;
+const FAKE_POSSESSION_DISTANCE: f32 = 560.0;
+const FAKE_DEFENDER_BALL_DISTANCE: f32 = 780.0;
+const FAKE_DEFENDER_MIN_SPEED: f32 = 575.0;
+const FAKE_DEFENDER_MIN_SPEED_TOWARD_BALL: f32 = 175.0;
+const FAKE_MIN_BALL_SPEED_DROP: f32 = 180.0;
+const FAKE_MIN_BALL_SPEED_CHANGE: f32 = 260.0;
+const FAKE_MAX_BALL_DIRECTION_DOT: f32 = 0.94;
+const FAKE_COOLDOWN_FRAMES: i32 = 90;
 const FRAME_PARQUET_ROW_GROUP_SIZE: usize = 2048;
+const TIME_ON_FIELD_WORKGROUP_SIZE: u32 = 256;
+const TIME_ON_FIELD_SHADER: &str = r#"
+struct Params {
+    interval_count: u32,
+    player_count: u32,
+}
+
+@group(0) @binding(0) var<storage, read> deltas: array<f32>;
+@group(0) @binding(1) var<storage, read> active: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let idx = id.x;
+    let total = params.interval_count * params.player_count;
+    if (idx >= total) {
+        return;
+    }
+    let interval_idx = idx / params.player_count;
+    output[idx] = deltas[interval_idx] * active[idx];
+}
+"#;
 
 #[derive(Clone, Copy, Debug)]
 enum ColumnKind {
@@ -91,9 +143,30 @@ enum ExportFormat {
     Parquet,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GpuMode {
+    None,
+    Auto,
+    Rocm,
+    Cuda,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContextMode {
+    Full,
+    FramesOnly,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct TimeOnFieldParams {
+    interval_count: u32,
+    player_count: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct ParseArgs {
-    replays: PathBuf,
+    replays: Vec<PathBuf>,
     out_json: Option<PathBuf>,
     out_pbp: PathBuf,
     out_analysis: Option<PathBuf>,
@@ -107,18 +180,34 @@ pub struct ParseArgs {
     export_network: bool,
     force: bool,
     pbp_format: ExportFormat,
+    gpu: GpuMode,
+    rotation_events: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct FramesArgs {
-    replays: PathBuf,
+    replays: Vec<PathBuf>,
     out_frames: PathBuf,
     workers: Option<usize>,
     limit: Option<usize>,
     parse_only: bool,
+    frames_only: bool,
     no_write: bool,
     force: bool,
     frames_format: ExportFormat,
+    gpu: GpuMode,
+    rotation_events: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct StatsArgs {
+    replays: Vec<PathBuf>,
+    out_stats: PathBuf,
+    workers: Option<usize>,
+    limit: Option<usize>,
+    force: bool,
+    stats_format: ExportFormat,
+    gpu: GpuMode,
 }
 
 #[derive(Clone, Debug)]
@@ -182,7 +271,6 @@ struct AnalysisRow {
     match_type: String,
     team_size: Option<i32>,
     playlist: String,
-    header_properties_json: String,
 }
 
 #[derive(Serialize)]
@@ -212,7 +300,6 @@ struct ActorRow {
     spawn_rotation_yaw: Option<i8>,
     spawn_rotation_pitch: Option<i8>,
     spawn_rotation_roll: Option<i8>,
-    new_actor_json: String,
 }
 
 #[derive(Serialize)]
@@ -259,7 +346,6 @@ struct AttributeRow {
     demolish_attacker_id: Option<i32>,
     demolish_victim_id: Option<i32>,
     stat_event_object_id: Option<i32>,
-    attribute_json: String,
 }
 
 #[derive(Serialize)]
@@ -275,13 +361,25 @@ struct PlayerRow {
     saves: Option<i32>,
     shots: Option<i32>,
     b_bot: Option<bool>,
-    stats_json: String,
 }
 
 struct PbpEventRecord {
     frame_number: Option<i32>,
     event_type: String,
     values: RowValues,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PbpBuildOptions {
+    rotation_events: bool,
+}
+
+impl Default for PbpBuildOptions {
+    fn default() -> Self {
+        Self {
+            rotation_events: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -306,6 +404,31 @@ impl RowValues {
             return;
         };
         self.cells[idx] = parse_cell_value(pbp_column_kinds_cached()[idx], &value);
+    }
+
+    fn set_cell(&mut self, key: &str, value: CellValue) {
+        let Some(idx) = pbp_column_index_cached().get(key).copied() else {
+            return;
+        };
+        self.cells[idx] = Some(value);
+    }
+
+    fn insert_utf8(&mut self, key: &str, value: String) {
+        self.set_cell(key, CellValue::Utf8(value));
+    }
+
+    fn insert_i32(&mut self, key: &str, value: i32) {
+        self.set_cell(key, CellValue::Int32(value));
+    }
+
+    fn insert_f32(&mut self, key: &str, value: f32) {
+        if value.is_finite() {
+            self.set_cell(key, CellValue::Float32(value));
+        }
+    }
+
+    fn insert_bool(&mut self, key: &str, value: bool) {
+        self.set_cell(key, CellValue::Boolean(value));
     }
 
     fn contains_key(&self, key: &str) -> bool {
@@ -340,6 +463,7 @@ impl RowValues {
 
 #[derive(Clone, Debug)]
 struct OfficialStatEvent {
+    pri_actor_id: Option<i32>,
     frame_number: i32,
     player_name: String,
     stat_type: &'static str,
@@ -363,11 +487,22 @@ struct PlayerInfo {
     slot: String,
     platform: String,
     is_bot: String,
+    score: String,
     title_id: String,
     first_frame_in_game: String,
     time_in_game: String,
     car_id: String,
     car_name: String,
+    decal_id: String,
+    wheels_id: String,
+    boost_id: String,
+    antenna_id: String,
+    topper_id: String,
+    engine_audio_id: String,
+    trail_id: String,
+    goal_explosion_id: String,
+    primary_paint_finish_id: String,
+    accent_paint_finish_id: String,
     camera_settings: Option<PlayerCameraSettings>,
 }
 
@@ -510,6 +645,7 @@ struct HitCandidate {
     player_name: String,
     collision_distance: f32,
     ball_state: EntityState,
+    player_positions: Vec<Option<Vec3>>,
     goal_number: i32,
 }
 
@@ -527,8 +663,11 @@ struct BallEvent {
     next_hit_frame_number: Option<i32>,
     goal_number: i32,
     ball_state: EntityState,
+    player_positions: Vec<Option<Vec3>>,
     goal: bool,
     shot: bool,
+    missed_shot: bool,
+    missed_pass: bool,
     pass_: bool,
     clear: bool,
     save: bool,
@@ -539,11 +678,12 @@ fn to_py_err(err: anyhow::Error) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(format!("{err:#}"))
 }
 
-#[pyfunction]
+#[pyfunction(signature = (replay_path, workers = None, rotation_events = true))]
 fn parse_frames(
     py: Python<'_>,
     replay_path: String,
     workers: Option<usize>,
+    rotation_events: bool,
 ) -> PyResult<Py<PyAny>> {
     if let Some(workers) = workers {
         rayon::ThreadPoolBuilder::new()
@@ -570,7 +710,7 @@ fn parse_frames(
                 .parse()
                 .with_context(|| format!("boxcars parsing {}", path.display()))?;
 
-            let (_, rows) = build_pbp_rows(&game_id, &replay)?;
+            let (_, rows) = build_pbp_rows(&game_id, &replay, PbpBuildOptions { rotation_events })?;
 
             Ok::<_, anyhow::Error>((game_id, rows))
         })
@@ -610,45 +750,58 @@ fn _boxcars(m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 pub fn frames_args(args: Vec<String>) -> Result<FramesArgs> {
-    let mut replays = None;
+    let mut replays = Vec::new();
     let mut out_frames = None;
     let mut workers = None;
     let mut limit = None;
     let mut parse_only = false;
+    let mut frames_only = false;
     let mut no_write = false;
     let mut force = false;
     let mut frames_format = ExportFormat::Parquet;
+    let mut gpu = GpuMode::None;
+    let mut rotation_events = true;
     let mut idx = 0;
     while idx < args.len() {
         match args[idx].as_str() {
-            "--replays" => replays = Some(next_path(&args, &mut idx)?),
+            "--replays" => replays.push(next_path(&args, &mut idx)?),
             "--out-frames" => out_frames = Some(next_path(&args, &mut idx)?),
             "--workers" => workers = Some(next_value(&args, &mut idx)?.parse()?),
             "--limit" => limit = Some(next_value(&args, &mut idx)?.parse()?),
             "--format" | "--frames-format" => {
                 frames_format = parse_export_format(&next_value(&args, &mut idx)?)?
             }
+            "--gpu" => gpu = parse_gpu_mode(&next_value(&args, &mut idx)?)?,
+            "--rotation-events" => rotation_events = parse_bool_flag(&args, &mut idx)?,
+            "--no-rotation-events" => rotation_events = false,
             "--parse-only" => parse_only = true,
+            "--frames-only" => frames_only = true,
             "--no-write" => no_write = true,
             "--force" => force = true,
             flag => return Err(anyhow!("unknown frames flag: {flag}")),
         }
         idx += 1;
     }
+    if replays.is_empty() {
+        return Err(anyhow!("missing --replays"));
+    }
     Ok(FramesArgs {
-        replays: replays.ok_or_else(|| anyhow!("missing --replays"))?,
+        replays,
         out_frames: out_frames.ok_or_else(|| anyhow!("missing --out-frames"))?,
         workers,
         limit,
         parse_only,
+        frames_only,
         no_write,
         force,
         frames_format,
+        gpu,
+        rotation_events,
     })
 }
 
 pub fn parse_args(args: Vec<String>) -> Result<ParseArgs> {
-    let mut replays = None;
+    let mut replays = Vec::new();
     let mut out_json = None;
     let mut out_analysis = None;
     let mut out_players = None;
@@ -662,10 +815,12 @@ pub fn parse_args(args: Vec<String>) -> Result<ParseArgs> {
     let mut export_network = false;
     let mut force = false;
     let mut pbp_format = ExportFormat::Csv;
+    let mut gpu = GpuMode::None;
+    let mut rotation_events = true;
     let mut idx = 0;
     while idx < args.len() {
         match args[idx].as_str() {
-            "--replays" => replays = Some(next_path(&args, &mut idx)?),
+            "--replays" => replays.push(next_path(&args, &mut idx)?),
             "--out-json" => out_json = Some(next_path(&args, &mut idx)?),
             "--out-analysis" => out_analysis = Some(next_path(&args, &mut idx)?),
             "--out-players" => out_players = Some(next_path(&args, &mut idx)?),
@@ -678,6 +833,9 @@ pub fn parse_args(args: Vec<String>) -> Result<ParseArgs> {
             "--format" | "--pbp-format" => {
                 pbp_format = parse_export_format(&next_value(&args, &mut idx)?)?
             }
+            "--gpu" => gpu = parse_gpu_mode(&next_value(&args, &mut idx)?)?,
+            "--rotation-events" => rotation_events = parse_bool_flag(&args, &mut idx)?,
+            "--no-rotation-events" => rotation_events = false,
             "--export-meta" => export_meta = true,
             "--export-network" => export_network = true,
             "--force" => force = true,
@@ -685,8 +843,11 @@ pub fn parse_args(args: Vec<String>) -> Result<ParseArgs> {
         }
         idx += 1;
     }
+    if replays.is_empty() {
+        return Err(anyhow!("missing --replays"));
+    }
     Ok(ParseArgs {
-        replays: replays.ok_or_else(|| anyhow!("missing --replays"))?,
+        replays,
         out_json,
         out_pbp: out_pbp.ok_or_else(|| anyhow!("missing --out-pbp"))?,
         out_analysis,
@@ -700,6 +861,46 @@ pub fn parse_args(args: Vec<String>) -> Result<ParseArgs> {
         export_network,
         force,
         pbp_format,
+        gpu,
+        rotation_events,
+    })
+}
+
+pub fn stats_args(args: Vec<String>) -> Result<StatsArgs> {
+    let mut replays = Vec::new();
+    let mut out_stats = None;
+    let mut workers = None;
+    let mut limit = None;
+    let mut force = false;
+    let mut stats_format = ExportFormat::Csv;
+    let mut gpu = GpuMode::None;
+    let mut idx = 0;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--replays" => replays.push(next_path(&args, &mut idx)?),
+            "--out-stats" => out_stats = Some(next_path(&args, &mut idx)?),
+            "--workers" => workers = Some(next_value(&args, &mut idx)?.parse()?),
+            "--limit" => limit = Some(next_value(&args, &mut idx)?.parse()?),
+            "--format" | "--stats-format" => {
+                stats_format = parse_export_format(&next_value(&args, &mut idx)?)?
+            }
+            "--gpu" => gpu = parse_gpu_mode(&next_value(&args, &mut idx)?)?,
+            "--force" => force = true,
+            flag => return Err(anyhow!("unknown stats flag: {flag}")),
+        }
+        idx += 1;
+    }
+    if replays.is_empty() {
+        return Err(anyhow!("missing --replays"));
+    }
+    Ok(StatsArgs {
+        replays,
+        out_stats: out_stats.ok_or_else(|| anyhow!("missing --out-stats"))?,
+        workers,
+        limit,
+        force,
+        stats_format,
+        gpu,
     })
 }
 
@@ -843,6 +1044,34 @@ fn parse_export_format(value: &str) -> Result<ExportFormat> {
     }
 }
 
+fn parse_bool_flag(args: &[String], idx: &mut usize) -> Result<bool> {
+    let value = next_value(args, idx)?;
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "y" | "on" => Ok(true),
+        "false" | "0" | "no" | "n" | "off" => Ok(false),
+        _ => Err(anyhow!("boolean flag value must be true or false")),
+    }
+}
+
+fn parse_gpu_mode(value: &str) -> Result<GpuMode> {
+    match value.to_ascii_lowercase().as_str() {
+        "cpu" => Ok(GpuMode::None),
+        "auto" => Ok(GpuMode::Auto),
+        "rocm" | "amd" | "radeon" => Ok(GpuMode::Rocm),
+        "cuda" | "nvidia" => Ok(GpuMode::Cuda),
+        _ => Err(anyhow!("gpu must be one of: auto, cuda, rocm, cpu")),
+    }
+}
+
+fn configure_gpu_mode(gpu: GpuMode) {
+    match gpu {
+        GpuMode::None => std::env::remove_var("ANALYZERL_GPU"),
+        GpuMode::Auto => std::env::set_var("ANALYZERL_GPU", "auto"),
+        GpuMode::Rocm => std::env::set_var("ANALYZERL_GPU", "rocm"),
+        GpuMode::Cuda => std::env::set_var("ANALYZERL_GPU", "cuda"),
+    }
+}
+
 fn export_extension(format: ExportFormat) -> &'static str {
     match format {
         ExportFormat::Csv => "csv",
@@ -874,6 +1103,7 @@ fn check_export_args(
 }
 
 pub fn parse_command(args: ParseArgs) -> Result<()> {
+    configure_gpu_mode(args.gpu);
     //Prepare only the output folders requested by the selected export mode.
     check_export_args(
         args.export_meta,
@@ -905,7 +1135,7 @@ pub fn parse_command(args: ParseArgs) -> Result<()> {
     }
 
     //Parse replays in parallel while keeping progress to one terminal line.
-    let mut replay_paths = replay_paths(&args.replays)?;
+    let mut replay_paths = replay_paths_many(&args.replays)?;
     if let Some(limit) = args.limit {
         replay_paths.truncate(limit);
     }
@@ -925,7 +1155,10 @@ pub fn parse_command(args: ParseArgs) -> Result<()> {
 }
 
 pub fn frames_command(args: FramesArgs) -> Result<()> {
-    fs::create_dir_all(&args.out_frames)?;
+    configure_gpu_mode(args.gpu);
+    if !args.no_write {
+        fs::create_dir_all(&args.out_frames)?;
+    }
     if let Some(workers) = args.workers {
         rayon::ThreadPoolBuilder::new()
             .num_threads(workers)
@@ -933,7 +1166,7 @@ pub fn frames_command(args: FramesArgs) -> Result<()> {
             .ok();
     }
 
-    let mut replay_paths = replay_paths(&args.replays)?;
+    let mut replay_paths = replay_paths_many(&args.replays)?;
     if let Some(limit) = args.limit {
         replay_paths.truncate(limit);
     }
@@ -950,6 +1183,527 @@ pub fn frames_command(args: FramesArgs) -> Result<()> {
     });
     finish_progress_line(total, &progress_lock);
     Ok(())
+}
+
+#[derive(Default, Serialize)]
+struct NativePlayerStatsRow {
+    replay_id: String,
+    player_id: String,
+    player_name: String,
+    team: String,
+    team_name: String,
+    platform: String,
+    score: f32,
+    games_played: i32,
+    time_in_game: f32,
+    time_on_field: f32,
+    shots: i32,
+    goals: i32,
+    saves: i32,
+    assists: i32,
+    touches: i32,
+    passes: i32,
+    turnovers: i32,
+    challenges: i32,
+    kickoffs: i32,
+    whiffs: i32,
+    fakes: i32,
+    demos_applied: i32,
+    demos_taken: i32,
+    bumps: i32,
+    bumps_taken: i32,
+    teammate_bumps: i32,
+    entries: i32,
+    exits: i32,
+    retrievals: i32,
+    missed_shots: i32,
+    missed_passes: i32,
+    shot_attempts: i32,
+    car_id: String,
+    car_name: String,
+    decal_id: String,
+    wheels_id: String,
+    boost_id: String,
+    antenna_id: String,
+    topper_id: String,
+    engine_audio_id: String,
+    trail_id: String,
+    goal_explosion_id: String,
+    primary_paint_finish_id: String,
+    accent_paint_finish_id: String,
+    camera_fov: String,
+    camera_height: String,
+    camera_angle: String,
+    camera_distance: String,
+    camera_stiffness: String,
+    camera_swivel: String,
+    camera_transition: String,
+}
+
+pub fn stats_command(args: StatsArgs) -> Result<()> {
+    configure_gpu_mode(args.gpu);
+    if args.stats_format != ExportFormat::Csv {
+        return Err(anyhow!("native stats currently exports csv"));
+    }
+    if !args.force && args.out_stats.exists() && args.out_stats.metadata()?.len() > 0 {
+        return Ok(());
+    }
+    if let Some(parent) = args.out_stats.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(workers) = args.workers {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build_global()
+            .ok();
+    }
+
+    let mut replay_paths = replay_paths_many(&args.replays)?;
+    if let Some(limit) = args.limit {
+        replay_paths.truncate(limit);
+    }
+    let total = replay_paths.len();
+    let completed = Arc::new(AtomicUsize::new(0));
+    let progress_lock = Arc::new(Mutex::new(()));
+    let rows = replay_paths
+        .par_iter()
+        .map(|path| {
+            let game_id = replay_game_id(path);
+            let output = native_stats_one(path, args.gpu);
+            let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
+            print_progress_line("built stats", &game_id, done, total, &progress_lock);
+            output
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    finish_progress_line(total, &progress_lock);
+
+    let mut writer = csv::Writer::from_path(&args.out_stats)?;
+    for row in rows {
+        writer.serialize(row)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn native_stats_one(path: &Path, gpu: GpuMode) -> Result<Vec<NativePlayerStatsRow>> {
+    let game_id = replay_game_id(path);
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let replay = boxcars::ParserBuilder::new(&bytes)
+        .must_parse_network_data()
+        .parse()
+        .with_context(|| format!("boxcars parsing {}", path.display()))?;
+    let (context, rows) = build_pbp_rows(&game_id, &replay, PbpBuildOptions::default())?;
+    Ok(native_stats_rows(&game_id, &context, &rows, gpu))
+}
+
+fn native_stats_rows(
+    game_id: &str,
+    context: &PbpContext,
+    rows: &[PbpEventRecord],
+    gpu: GpuMode,
+) -> Vec<NativePlayerStatsRow> {
+    let team_names = team_names_from_context(context, rows);
+    let time_on_field_minutes = native_time_on_field_minutes(context, gpu);
+    let mut output = context
+        .players
+        .iter()
+        .enumerate()
+        .map(|(player_idx, player)| {
+            let camera = player.camera_settings;
+            let time_on_field = time_on_field_minutes
+                .get(player_idx)
+                .copied()
+                .unwrap_or_default();
+            (
+                player.name.clone(),
+                NativePlayerStatsRow {
+                    replay_id: game_id.to_string(),
+                    player_id: player.id.clone(),
+                    player_name: player.name.clone(),
+                    team: team_name(player.team).to_string(),
+                    team_name: team_names.get(&player.team).cloned().unwrap_or_default(),
+                    platform: player.platform.clone(),
+                    score: player.score.parse::<f32>().unwrap_or(0.0),
+                    games_played: 1,
+                    time_in_game: time_on_field,
+                    time_on_field,
+                    car_id: player.car_id.clone(),
+                    car_name: player.car_name.clone(),
+                    decal_id: player.decal_id.clone(),
+                    wheels_id: player.wheels_id.clone(),
+                    boost_id: player.boost_id.clone(),
+                    antenna_id: player.antenna_id.clone(),
+                    topper_id: player.topper_id.clone(),
+                    engine_audio_id: player.engine_audio_id.clone(),
+                    trail_id: player.trail_id.clone(),
+                    goal_explosion_id: player.goal_explosion_id.clone(),
+                    primary_paint_finish_id: player.primary_paint_finish_id.clone(),
+                    accent_paint_finish_id: player.accent_paint_finish_id.clone(),
+                    camera_fov: camera
+                        .map(|value| value.fov.to_string())
+                        .unwrap_or_default(),
+                    camera_height: camera
+                        .map(|value| value.height.to_string())
+                        .unwrap_or_default(),
+                    camera_angle: camera
+                        .map(|value| value.angle.to_string())
+                        .unwrap_or_default(),
+                    camera_distance: camera
+                        .map(|value| value.distance.to_string())
+                        .unwrap_or_default(),
+                    camera_stiffness: camera
+                        .map(|value| value.stiffness.to_string())
+                        .unwrap_or_default(),
+                    camera_swivel: camera
+                        .map(|value| value.swivel.to_string())
+                        .unwrap_or_default(),
+                    camera_transition: camera
+                        .and_then(|value| value.transition)
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                    ..NativePlayerStatsRow::default()
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    for row in rows {
+        let event_type = row.event_type.as_str();
+        let player_1 = row_string(&row.values, "event_player_1_name");
+        let player_2 = row_string(&row.values, "event_player_2_name");
+        if let Some(stats) = output.get_mut(&player_1) {
+            match event_type {
+                "shot" => stats.shots += 1,
+                "goal" => {
+                    stats.goals += 1;
+                    stats.shots += 1;
+                }
+                "save" => stats.saves += 1,
+                "touch" => stats.touches += 1,
+                "pass" => {
+                    stats.passes += 1;
+                    stats.touches += 1;
+                }
+                "turnover" => {
+                    stats.turnovers += 1;
+                    stats.touches += 1;
+                }
+                "challenge" => stats.challenges += 1,
+                "kickoff" => stats.kickoffs += 1,
+                "whiff" => stats.whiffs += 1,
+                "fake" => stats.fakes += 1,
+                "demo" => stats.demos_applied += 1,
+                "bump" => stats.bumps += 1,
+                "entry" => stats.entries += 1,
+                "exit" => stats.exits += 1,
+                "retrieval" => stats.retrievals += 1,
+                "missed-shot" => stats.missed_shots += 1,
+                "missed-pass" => stats.missed_passes += 1,
+                _ => {}
+            }
+            if matches!(event_type, "shot" | "goal" | "missed-shot") {
+                stats.shot_attempts += 1;
+            }
+        }
+        if let Some(stats) = output.get_mut(&player_2) {
+            match event_type {
+                "goal" => stats.assists += 1,
+                "demo" => stats.demos_taken += 1,
+                "bump" => stats.bumps_taken += 1,
+                _ => {}
+            }
+        }
+    }
+
+    let mut rows = output.into_values().collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.team
+            .cmp(&right.team)
+            .then_with(|| left.player_name.cmp(&right.player_name))
+    });
+    rows
+}
+
+fn team_names_from_context(context: &PbpContext, rows: &[PbpEventRecord]) -> HashMap<i32, String> {
+    let mut names = HashMap::new();
+    for row in rows {
+        let blue = row_string(&row.values, "blue_team_name");
+        if !blue.is_empty() {
+            names.insert(0, blue);
+        }
+        let orange = row_string(&row.values, "orange_team_name");
+        if !orange.is_empty() {
+            names.insert(1, orange);
+        }
+    }
+    for player in &context.players {
+        names.entry(player.team).or_default();
+    }
+    names
+}
+
+fn native_time_on_field_minutes(context: &PbpContext, gpu: GpuMode) -> Vec<f32> {
+    let player_count = context.players.len();
+    if player_count == 0 {
+        return Vec::new();
+    }
+
+    let (deltas, active) = native_time_on_field_inputs(context);
+    if deltas.is_empty() {
+        return vec![0.0; player_count];
+    }
+
+    let seconds = match gpu {
+        GpuMode::None => native_time_on_field_cpu(&deltas, &active, player_count),
+        GpuMode::Auto | GpuMode::Rocm | GpuMode::Cuda => {
+            native_time_on_field_gpu(&deltas, &active, player_count)
+                .unwrap_or_else(|_| native_time_on_field_cpu(&deltas, &active, player_count))
+        }
+    };
+
+    seconds.into_iter().map(|value| value / 60.0).collect()
+}
+
+fn native_time_on_field_inputs(context: &PbpContext) -> (Vec<f32>, Vec<f32>) {
+    let player_count = context.players.len();
+    let mut deltas = Vec::with_capacity(context.frame_states.len().saturating_sub(1));
+    let mut active = Vec::with_capacity(deltas.capacity() * player_count);
+
+    for pair in context.frame_states.windows(2) {
+        let previous = &pair[0];
+        let current = &pair[1];
+        let delta = match (previous.seconds_elapsed, current.seconds_elapsed) {
+            (Some(left), Some(right)) => (right - left).clamp(0.0, 1.0),
+            _ => 1.0 / 30.0,
+        };
+        deltas.push(delta);
+        for player_idx in 0..player_count {
+            let player_active = previous
+                .players
+                .get(player_idx)
+                .and_then(Option::as_ref)
+                .map(|state| state.entity.has_pos)
+                .unwrap_or(false);
+            active.push(if player_active { 1.0 } else { 0.0 });
+        }
+    }
+
+    (deltas, active)
+}
+
+fn native_time_on_field_cpu(deltas: &[f32], active: &[f32], player_count: usize) -> Vec<f32> {
+    let mut totals = vec![0.0; player_count];
+    for (interval_idx, delta) in deltas.iter().copied().enumerate() {
+        let offset = interval_idx * player_count;
+        for player_idx in 0..player_count {
+            totals[player_idx] += delta * active[offset + player_idx];
+        }
+    }
+    totals
+}
+
+fn native_time_on_field_gpu(
+    deltas: &[f32],
+    active: &[f32],
+    player_count: usize,
+) -> Result<Vec<f32>> {
+    if deltas.is_empty() || player_count == 0 {
+        return Ok(vec![0.0; player_count]);
+    }
+    if active.len() != deltas.len() * player_count {
+        return Err(anyhow!("invalid time-on-field GPU input shape"));
+    }
+
+    let contributions = pollster::block_on(native_time_on_field_gpu_contributions(
+        deltas,
+        active,
+        player_count,
+    ))?;
+    Ok(native_time_on_field_cpu_reduce(
+        &contributions,
+        deltas.len(),
+        player_count,
+    ))
+}
+
+async fn native_time_on_field_gpu_contributions(
+    deltas: &[f32],
+    active: &[f32],
+    player_count: usize,
+) -> Result<Vec<f32>> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::PRIMARY,
+        flags: wgpu::InstanceFlags::empty(),
+        dx12_shader_compiler: Default::default(),
+        gles_minor_version: wgpu::Gles3MinorVersion::Automatic,
+    });
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        })
+        .await
+        .ok_or_else(|| anyhow!("no GPU adapter available"))?;
+    let (device, queue) = adapter
+        .request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("analyzerl native stats gpu device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::downlevel_defaults(),
+            },
+            None,
+        )
+        .await?;
+
+    let output_len = active.len();
+    let output_size = (output_len * std::mem::size_of::<f32>()) as wgpu::BufferAddress;
+    let delta_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("analyzerl time-on-field deltas"),
+        contents: bytemuck::cast_slice(deltas),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let active_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("analyzerl time-on-field active flags"),
+        contents: bytemuck::cast_slice(active),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("analyzerl time-on-field gpu output"),
+        size: output_size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("analyzerl time-on-field gpu staging"),
+        size: output_size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let params = TimeOnFieldParams {
+        interval_count: deltas.len() as u32,
+        player_count: player_count as u32,
+    };
+    let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("analyzerl time-on-field params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("analyzerl time-on-field shader"),
+        source: wgpu::ShaderSource::Wgsl(TIME_ON_FIELD_SHADER.into()),
+    });
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("analyzerl time-on-field bind group layout"),
+        entries: &[
+            storage_entry(0, true),
+            storage_entry(1, true),
+            storage_entry(2, false),
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("analyzerl time-on-field bind group"),
+        layout: &bind_group_layout,
+        entries: &[
+            buffer_entry(0, &delta_buffer),
+            buffer_entry(1, &active_buffer),
+            buffer_entry(2, &output_buffer),
+            buffer_entry(3, &params_buffer),
+        ],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("analyzerl time-on-field pipeline layout"),
+        bind_group_layouts: &[&bind_group_layout],
+        push_constant_ranges: &[],
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("analyzerl time-on-field pipeline"),
+        layout: Some(&pipeline_layout),
+        module: &shader,
+        entry_point: "main",
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("analyzerl time-on-field encoder"),
+    });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("analyzerl time-on-field pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        let workgroups =
+            ((output_len as u32) + TIME_ON_FIELD_WORKGROUP_SIZE - 1) / TIME_ON_FIELD_WORKGROUP_SIZE;
+        pass.dispatch_workgroups(workgroups, 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_size);
+    queue.submit(Some(encoder.finish()));
+
+    let slice = staging_buffer.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+    device.poll(wgpu::Maintain::Wait);
+    receiver
+        .recv()
+        .context("waiting for GPU time-on-field map")??;
+    let mapped = slice.get_mapped_range();
+    let output = bytemuck::cast_slice(&mapped).to_vec();
+    drop(mapped);
+    staging_buffer.unmap();
+    Ok(output)
+}
+
+fn native_time_on_field_cpu_reduce(
+    contributions: &[f32],
+    interval_count: usize,
+    player_count: usize,
+) -> Vec<f32> {
+    let mut totals = vec![0.0; player_count];
+    for interval_idx in 0..interval_count {
+        let offset = interval_idx * player_count;
+        for player_idx in 0..player_count {
+            totals[player_idx] += contributions[offset + player_idx];
+        }
+    }
+    totals
+}
+
+fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn buffer_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry {
+        binding,
+        resource: buffer.as_entire_binding(),
+    }
 }
 
 fn frames_one(path: &Path, args: &FramesArgs) -> Result<()> {
@@ -974,11 +1728,34 @@ fn frames_one(path: &Path, args: &FramesArgs) -> Result<()> {
     if args.parse_only {
         //Benchmarking switch: confirms boxcars parse cost without AnalyzeRL feature generation.
     } else if args.no_write {
-        let _ = build_pbp_rows(&game_id, &replay)?;
+        let _ = materialize_frame_rows_for_benchmark(
+            &game_id,
+            &replay,
+            !args.frames_only,
+            PbpBuildOptions {
+                rotation_events: args.rotation_events,
+            },
+        )?;
     } else {
         match args.frames_format {
-            ExportFormat::Csv => write_frames_csv(&frames_path, &game_id, &replay)?,
-            ExportFormat::Parquet => write_frames_parquet(&frames_path, &game_id, &replay)?,
+            ExportFormat::Csv => write_frames_csv(
+                &frames_path,
+                &game_id,
+                &replay,
+                !args.frames_only,
+                PbpBuildOptions {
+                    rotation_events: args.rotation_events,
+                },
+            )?,
+            ExportFormat::Parquet => write_frames_parquet(
+                &frames_path,
+                &game_id,
+                &replay,
+                !args.frames_only,
+                PbpBuildOptions {
+                    rotation_events: args.rotation_events,
+                },
+            )?,
         }
     }
     Ok(())
@@ -1120,8 +1897,10 @@ fn write_matched_outputs(game_id: &str, replay: &Replay, args: &MatchGuidArgs) -
         export_extension(args.pbp_format)
     ));
     match args.pbp_format {
-        ExportFormat::Csv => write_pbp_csv(&pbp_path, game_id, replay)?,
-        ExportFormat::Parquet => write_pbp_parquet(&pbp_path, game_id, replay)?,
+        ExportFormat::Csv => write_pbp_csv(&pbp_path, game_id, replay, PbpBuildOptions::default())?,
+        ExportFormat::Parquet => {
+            write_pbp_parquet(&pbp_path, game_id, replay, PbpBuildOptions::default())?
+        }
     }
     Ok(())
 }
@@ -1225,8 +2004,12 @@ pub fn match_guids_command(args: MatchGuidsArgs) -> Result<()> {
                 export_extension(args.pbp_format)
             ));
             match args.pbp_format {
-                ExportFormat::Csv => write_pbp_csv(&pbp_path, &game_id, &replay)?,
-                ExportFormat::Parquet => write_pbp_parquet(&pbp_path, &game_id, &replay)?,
+                ExportFormat::Csv => {
+                    write_pbp_csv(&pbp_path, &game_id, &replay, PbpBuildOptions::default())?
+                }
+                ExportFormat::Parquet => {
+                    write_pbp_parquet(&pbp_path, &game_id, &replay, PbpBuildOptions::default())?
+                }
             }
             println!("{game_id},{replay_guid}");
             return Ok(());
@@ -1253,6 +2036,16 @@ fn replay_paths(folder: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     paths.sort();
+    Ok(paths)
+}
+
+fn replay_paths_many(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for input in inputs {
+        paths.extend(replay_paths(input)?);
+    }
+    paths.sort();
+    paths.dedup();
     Ok(paths)
 }
 
@@ -1361,8 +2154,22 @@ fn parse_one(path: &Path, args: &ParseArgs) -> Result<()> {
     }
     if pbp_missing {
         match args.pbp_format {
-            ExportFormat::Csv => write_pbp_csv(&pbp_path, &game_id, &replay)?,
-            ExportFormat::Parquet => write_pbp_parquet(&pbp_path, &game_id, &replay)?,
+            ExportFormat::Csv => write_pbp_csv(
+                &pbp_path,
+                &game_id,
+                &replay,
+                PbpBuildOptions {
+                    rotation_events: args.rotation_events,
+                },
+            )?,
+            ExportFormat::Parquet => write_pbp_parquet(
+                &pbp_path,
+                &game_id,
+                &replay,
+                PbpBuildOptions {
+                    rotation_events: args.rotation_events,
+                },
+            )?,
         }
     }
     Ok(())
@@ -1425,7 +2232,12 @@ pub fn animate_json_command(args: Vec<String>) -> Result<()> {
     let context = pbp_context(&replay);
     let replay_id = header_string(&replay, "Id").unwrap_or_else(|| game_id.clone());
     let (final_blue_score, final_orange_score) = header_final_score(&replay);
-    let pbp_bytes = write_pbp_to_writer(csv::Writer::from_writer(Vec::new()), &game_id, &replay)?;
+    let pbp_bytes = write_pbp_to_writer(
+        csv::Writer::from_writer(Vec::new()),
+        &game_id,
+        &replay,
+        PbpBuildOptions::default(),
+    )?;
     let pbp_csv = String::from_utf8(pbp_bytes)?;
     let frames = context
         .frame_states
@@ -1665,7 +2477,7 @@ fn inspect_attribute_value(attribute: &Attribute) -> String {
         Attribute::String(value) => value.clone(),
         Attribute::Location(value) => format!("{},{},{}", value.x, value.y, value.z),
         Attribute::ActiveActor(value) => format!("active={},actor={}", value.active, value.actor.0),
-        _ => serde_json::to_string(attribute).unwrap_or_default(),
+        _ => attribute_type(attribute).to_string(),
     }
 }
 
@@ -1703,7 +2515,6 @@ fn write_analysis_csv(path: &Path, game_id: &str, replay: &Replay) -> Result<()>
         match_type: header_string(replay, "MatchType").unwrap_or_default(),
         team_size: header_actual_team_size(replay).or_else(|| header_i32(replay, "TeamSize")),
         playlist: header_string(replay, "Playlist").unwrap_or_default(),
-        header_properties_json: serde_json::to_string(&replay.properties)?,
     })?;
     writer.flush()?;
     Ok(())
@@ -1755,7 +2566,6 @@ fn write_network_csvs(
                     spawn_rotation_yaw: rotation.and_then(|value| value.yaw),
                     spawn_rotation_pitch: rotation.and_then(|value| value.pitch),
                     spawn_rotation_roll: rotation.and_then(|value| value.roll),
-                    new_actor_json: serde_json::to_string(new_actor)?,
                 })?;
             }
             for actor_id in &frame.deleted_actors {
@@ -1834,7 +2644,6 @@ fn attribute_row(
         demolish_attacker_id: None,
         demolish_victim_id: None,
         stat_event_object_id: None,
-        attribute_json: serde_json::to_string(&updated_actor.attribute)?,
     };
 
     match &updated_actor.attribute {
@@ -1961,7 +2770,6 @@ fn write_players_csv(path: &Path, game_id: &str, replay: &Replay) -> Result<()> 
                 saves: prop_i32(player, "Saves"),
                 shots: prop_i32(player, "Shots"),
                 b_bot: prop_bool(player, "bBot"),
-                stats_json: serde_json::to_string(player)?,
             })?;
         }
     }
@@ -1969,11 +2777,20 @@ fn write_players_csv(path: &Path, game_id: &str, replay: &Replay) -> Result<()> 
     Ok(())
 }
 
-fn write_pbp_csv(path: &Path, game_id: &str, replay: &Replay) -> Result<()> {
-    write_pbp_to_writer(csv::Writer::from_path(path)?, game_id, replay).map(|_| ())
+fn write_pbp_csv(
+    path: &Path,
+    game_id: &str,
+    replay: &Replay,
+    options: PbpBuildOptions,
+) -> Result<()> {
+    write_pbp_to_writer(csv::Writer::from_path(path)?, game_id, replay, options).map(|_| ())
 }
 
-fn build_pbp_rows(game_id: &str, replay: &Replay) -> Result<(PbpContext, Vec<PbpEventRecord>)> {
+fn build_pbp_rows(
+    game_id: &str,
+    replay: &Replay,
+    options: PbpBuildOptions,
+) -> Result<(PbpContext, Vec<PbpEventRecord>)> {
     let match_guid = String::new();
     let replay_name = String::new();
     let map_id = String::new();
@@ -2056,7 +2873,6 @@ fn build_pbp_rows(game_id: &str, replay: &Replay) -> Result<(PbpContext, Vec<Pbp
                 add_pbp_players(&mut values, &player_static_values);
                 if let Some(frame) = frame_number {
                     add_frame_state_values(&mut values, &context, frame, &players);
-                    add_spatial_features(&mut values, &players);
                 }
                 rows.push(PbpEventRecord {
                     frame_number,
@@ -2146,7 +2962,6 @@ fn build_pbp_rows(game_id: &str, replay: &Replay) -> Result<(PbpContext, Vec<Pbp
         }
         add_pbp_players(&mut values, &player_static_values);
         add_frame_state_values(&mut values, &context, event.frame_number, &players);
-        add_spatial_features(&mut values, &players);
         rows.push(PbpEventRecord {
             frame_number: Some(event.frame_number),
             event_type: event.event_type.clone(),
@@ -2221,7 +3036,6 @@ fn build_pbp_rows(game_id: &str, replay: &Replay) -> Result<(PbpContext, Vec<Pbp
         );
         add_pbp_players(&mut values, &player_static_values);
         add_frame_state_values(&mut values, &context, feature_event.frame_number, &players);
-        add_spatial_features(&mut values, &players);
         rows.push(PbpEventRecord {
             frame_number: Some(feature_event.frame_number),
             event_type: feature_event.event_type.clone(),
@@ -2243,7 +3057,6 @@ fn build_pbp_rows(game_id: &str, replay: &Replay) -> Result<(PbpContext, Vec<Pbp
     );
     sort_pbp_rows(&mut rows);
     filter_goal_to_kickoff_rows(&mut rows, &goal_frames);
-    sort_pbp_rows(&mut rows);
 
     //Tag recorded shots, goals, assists, and saves onto observed event rows.
     apply_official_stats(
@@ -2273,7 +3086,6 @@ fn build_pbp_rows(game_id: &str, replay: &Replay) -> Result<(PbpContext, Vec<Pbp
         team_size,
         &game_time,
     );
-    sort_pbp_rows(&mut rows);
     add_pressure_events(
         &mut rows,
         &context,
@@ -2285,7 +3097,28 @@ fn build_pbp_rows(game_id: &str, replay: &Replay) -> Result<(PbpContext, Vec<Pbp
         team_size,
         &game_time,
     );
-    sort_pbp_rows(&mut rows);
+    add_whiff_events(
+        &mut rows,
+        &context,
+        &player_static_values,
+        game_id,
+        &match_guid,
+        &replay_name,
+        &map_id,
+        team_size,
+        &game_time,
+    );
+    add_fake_events(
+        &mut rows,
+        &context,
+        &player_static_values,
+        game_id,
+        &match_guid,
+        &replay_name,
+        &map_id,
+        team_size,
+        &game_time,
+    );
     add_car_contact_events(
         &mut rows,
         &context,
@@ -2297,7 +3130,6 @@ fn build_pbp_rows(game_id: &str, replay: &Replay) -> Result<(PbpContext, Vec<Pbp
         team_size,
         &game_time,
     );
-    sort_pbp_rows(&mut rows);
     add_boost_pickup_events(
         &mut rows,
         &context,
@@ -2309,7 +3141,6 @@ fn build_pbp_rows(game_id: &str, replay: &Replay) -> Result<(PbpContext, Vec<Pbp
         team_size,
         &game_time,
     );
-    sort_pbp_rows(&mut rows);
     add_flip_reset_events(
         &mut rows,
         &context,
@@ -2323,37 +3154,34 @@ fn build_pbp_rows(game_id: &str, replay: &Replay) -> Result<(PbpContext, Vec<Pbp
     );
     sort_pbp_rows(&mut rows);
     filter_goal_to_kickoff_rows(&mut rows, &goal_frames);
-    sort_pbp_rows(&mut rows);
 
-    //Match final PBP counts back to the replay header before export.
-    reconcile_header_stats(
-        &mut rows,
-        replay,
-        &players,
-        &player_static_values,
-        game_id,
-        &match_guid,
-        &replay_name,
-        &map_id,
-        &context,
-        team_size,
-        &game_time,
-    );
     collapse_duplicate_official_saves(&mut rows);
     sort_pbp_rows(&mut rows);
 
     //Fill default flags and run the remaining row-level feature passes.
     post_process_pbp_rows(&mut rows, &players);
-    audit_pbp_stats(game_id, replay, &rows)?;
+    audit_pbp_stats(game_id, replay, &rows, &context)?;
+    if options.rotation_events {
+        add_rotation_events(
+            &mut rows,
+            &context,
+            &player_static_values,
+            game_id,
+            &match_guid,
+            &replay_name,
+            &map_id,
+            team_size,
+            &game_time,
+        );
+    }
+    sort_pbp_rows(&mut rows);
     for (idx, row) in rows.iter_mut().enumerate() {
         if !row.values.contains_key("observed_frame_number") {
             if let Some(frame) = row.frame_number {
-                row.values
-                    .insert("observed_frame_number".to_string(), frame.to_string());
+                row.values.insert_i32("observed_frame_number", frame);
             }
         }
-        row.values
-            .insert("event_number".to_string(), (idx + 1).to_string());
+        row.values.insert_i32("event_number", (idx + 1) as i32);
     }
     Ok((context, rows))
 }
@@ -2371,20 +3199,32 @@ fn write_pbp_to_writer<W: Write + Send + Sync + 'static>(
     mut writer: csv::Writer<W>,
     game_id: &str,
     replay: &Replay,
+    options: PbpBuildOptions,
 ) -> Result<W> {
     let columns = pbp_columns_cached();
     writer.write_record(columns.iter())?;
-    let (_, rows) = build_pbp_rows(game_id, replay)?;
+    let (_, rows) = build_pbp_rows(game_id, replay, options)?;
     let static_defaults = vec![None; columns.len()];
+    let mut record = csv::StringRecord::new();
     for row in &rows {
-        write_csv_row(&mut writer, row.values.as_slice(), &static_defaults)?;
+        write_csv_row(
+            &mut writer,
+            row.values.as_slice(),
+            &static_defaults,
+            &mut record,
+        )?;
     }
 
     writer.flush()?;
     Ok(writer.into_inner()?)
 }
 
-fn write_pbp_parquet(path: &Path, game_id: &str, replay: &Replay) -> Result<()> {
+fn write_pbp_parquet(
+    path: &Path,
+    game_id: &str,
+    replay: &Replay,
+    options: PbpBuildOptions,
+) -> Result<()> {
     let columns = pbp_columns_cached().clone();
     let schema = Arc::new(Schema::new(
         columns
@@ -2401,7 +3241,7 @@ fn write_pbp_parquet(path: &Path, game_id: &str, replay: &Replay) -> Result<()> 
         .build();
     let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
     let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
-    let (_, pbp_rows) = build_pbp_rows(game_id, replay)?;
+    let (_, pbp_rows) = build_pbp_rows(game_id, replay, options)?;
     let mut rows = Vec::with_capacity(pbp_rows.len());
 
     for pbp_row in pbp_rows {
@@ -2416,24 +3256,25 @@ fn write_pbp_parquet(path: &Path, game_id: &str, replay: &Replay) -> Result<()> 
     Ok(())
 }
 
-fn write_frames_csv(path: &Path, game_id: &str, replay: &Replay) -> Result<()> {
-    let mut columns = pbp_columns();
-    for column in ["frame_has_event", "frame_event_count"] {
-        if !columns.iter().any(|existing| existing == column) {
-            columns.push(column.to_string());
-        }
-    }
-
-    let column_kinds = columns
-        .iter()
-        .map(|column| column_kind(column))
-        .collect::<Vec<_>>();
-    let column_index = column_index(&columns);
+fn write_frames_csv(
+    path: &Path,
+    game_id: &str,
+    replay: &Replay,
+    include_events: bool,
+    options: PbpBuildOptions,
+) -> Result<()> {
+    let columns = frame_columns_cached();
+    let column_kinds = frame_column_kinds_cached();
+    let column_index = frame_column_index_cached();
     let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
     let mut writer = csv::Writer::from_writer(file);
-    writer.write_record(&columns)?;
+    writer.write_record(columns.iter())?;
 
-    let (context, pbp_rows) = build_pbp_rows(game_id, replay)?;
+    let (context, pbp_rows) = if include_events {
+        build_pbp_rows(game_id, replay, options)?
+    } else {
+        (frame_context(replay), Vec::new())
+    };
     let mut events_by_frame: HashMap<i32, Vec<RowValues>> = HashMap::new();
     for row in pbp_rows {
         let frame = row_i32(&row.values, "observed_frame_number")
@@ -2446,6 +3287,7 @@ fn write_frames_csv(path: &Path, game_id: &str, replay: &Replay) -> Result<()> {
     let players = context.players.clone();
     let team_size = actual_team_size(&players).or_else(|| header_i32(replay, "TeamSize"));
     let player_static_values = pbp_player_static_values(&players);
+    let frame_indexes = frame_row_indexes(column_index, &players);
     let mut static_row = vec![None; columns.len()];
     set_row_value(
         &mut static_row,
@@ -2474,43 +3316,37 @@ fn write_frames_csv(path: &Path, game_id: &str, replay: &Replay) -> Result<()> {
         }
     }
 
+    let mut record = csv::StringRecord::new();
     for snapshot in &context.frame_states {
         let mut base = vec![None; columns.len()];
-        set_row_value(
+        set_idx_i32(&mut base, frame_indexes.frame_number, snapshot.frame_number);
+        set_idx_i32(
             &mut base,
-            &column_index,
-            "frame_number",
-            snapshot.frame_number,
-        );
-        set_row_value(
-            &mut base,
-            &column_index,
-            "observed_frame_number",
+            frame_indexes.observed_frame_number,
             snapshot.frame_number,
         );
         if let Some(seconds) = snapshot.seconds_elapsed {
-            set_row_f32(&mut base, &column_index, "seconds_elapsed", seconds);
+            set_idx_f32(&mut base, frame_indexes.seconds_elapsed, seconds);
         }
-        add_frame_state_values_row(&mut base, &column_index, snapshot, &players);
-        add_spatial_features_row(&mut base, &column_index, snapshot, &players);
+        add_frame_state_values_row_indexed(&mut base, &frame_indexes, snapshot);
+        add_spatial_features_row_indexed(&mut base, &frame_indexes, snapshot, &players);
 
         if let Some(events) = events_by_frame.get(&snapshot.frame_number) {
             for event in events {
                 let mut values = base.clone();
                 overlay_event_values(&mut values, event);
-                set_row_bool(&mut values, &column_index, "frame_has_event", true);
-                set_row_i32(
+                set_idx_bool(&mut values, frame_indexes.frame_has_event, true);
+                set_idx_i32(
                     &mut values,
-                    &column_index,
-                    "frame_event_count",
+                    frame_indexes.frame_event_count,
                     events.len() as i32,
                 );
-                write_csv_row(&mut writer, &values, &static_row)?;
+                write_csv_row(&mut writer, &values, &static_row, &mut record)?;
             }
         } else {
-            set_row_bool(&mut base, &column_index, "frame_has_event", false);
-            set_row_i32(&mut base, &column_index, "frame_event_count", 0);
-            write_csv_row(&mut writer, &base, &static_row)?;
+            set_idx_bool(&mut base, frame_indexes.frame_has_event, false);
+            set_idx_i32(&mut base, frame_indexes.frame_event_count, 0);
+            write_csv_row(&mut writer, &base, &static_row, &mut record)?;
         }
     }
 
@@ -2518,31 +3354,27 @@ fn write_frames_csv(path: &Path, game_id: &str, replay: &Replay) -> Result<()> {
     Ok(())
 }
 
-fn write_frames_parquet(path: &Path, game_id: &str, replay: &Replay) -> Result<()> {
-    let mut columns = pbp_columns();
-    for column in ["frame_has_event", "frame_event_count"] {
-        if !columns.iter().any(|existing| existing == column) {
-            columns.push(column.to_string());
-        }
-    }
-
-    let schema = Arc::new(Schema::new(
-        columns
-            .iter()
-            .map(|column| Field::new(column, arrow_data_type(column_kind(column)), true))
-            .collect::<Vec<_>>(),
-    ));
-    let column_kinds = columns
-        .iter()
-        .map(|column| column_kind(column))
-        .collect::<Vec<_>>();
+fn write_frames_parquet(
+    path: &Path,
+    game_id: &str,
+    replay: &Replay,
+    include_events: bool,
+    options: PbpBuildOptions,
+) -> Result<()> {
+    let columns = frame_columns_cached();
+    let schema = frame_schema_cached();
+    let column_kinds = frame_column_kinds_cached();
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
         .build();
     let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
     let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))?;
 
-    let (context, pbp_rows) = build_pbp_rows(game_id, replay)?;
+    let (context, pbp_rows) = if include_events {
+        build_pbp_rows(game_id, replay, options)?
+    } else {
+        (frame_context(replay), Vec::new())
+    };
     let mut events_by_frame: HashMap<i32, Vec<RowValues>> = HashMap::new();
     for row in pbp_rows {
         let frame = row_i32(&row.values, "observed_frame_number")
@@ -2555,7 +3387,8 @@ fn write_frames_parquet(path: &Path, game_id: &str, replay: &Replay) -> Result<(
     let players = context.players.clone();
     let team_size = actual_team_size(&players).or_else(|| header_i32(replay, "TeamSize"));
     let player_static_values = pbp_player_static_values(&players);
-    let column_index = column_index(&columns);
+    let column_index = frame_column_index_cached();
+    let frame_indexes = frame_row_indexes(column_index, &players);
     let mut static_row = vec![None; columns.len()];
     set_row_value(
         &mut static_row,
@@ -2587,33 +3420,26 @@ fn write_frames_parquet(path: &Path, game_id: &str, replay: &Replay) -> Result<(
 
     for snapshot in &context.frame_states {
         let mut base = vec![None; columns.len()];
-        set_row_value(
+        set_idx_i32(&mut base, frame_indexes.frame_number, snapshot.frame_number);
+        set_idx_i32(
             &mut base,
-            &column_index,
-            "frame_number",
-            snapshot.frame_number,
-        );
-        set_row_value(
-            &mut base,
-            &column_index,
-            "observed_frame_number",
+            frame_indexes.observed_frame_number,
             snapshot.frame_number,
         );
         if let Some(seconds) = snapshot.seconds_elapsed {
-            set_row_f32(&mut base, &column_index, "seconds_elapsed", seconds);
+            set_idx_f32(&mut base, frame_indexes.seconds_elapsed, seconds);
         }
-        add_frame_state_values_row(&mut base, &column_index, snapshot, &players);
-        add_spatial_features_row(&mut base, &column_index, snapshot, &players);
+        add_frame_state_values_row_indexed(&mut base, &frame_indexes, snapshot);
+        add_spatial_features_row_indexed(&mut base, &frame_indexes, snapshot, &players);
 
         if let Some(events) = events_by_frame.get(&snapshot.frame_number) {
             for event in events {
                 let mut values = base.clone();
                 overlay_event_values(&mut values, event);
-                set_row_bool(&mut values, &column_index, "frame_has_event", true);
-                set_row_i32(
+                set_idx_bool(&mut values, frame_indexes.frame_has_event, true);
+                set_idx_i32(
                     &mut values,
-                    &column_index,
-                    "frame_event_count",
+                    frame_indexes.frame_event_count,
                     events.len() as i32,
                 );
                 rows.push(values);
@@ -2629,8 +3455,8 @@ fn write_frames_parquet(path: &Path, game_id: &str, replay: &Replay) -> Result<(
                 }
             }
         } else {
-            set_row_bool(&mut base, &column_index, "frame_has_event", false);
-            set_row_i32(&mut base, &column_index, "frame_event_count", 0);
+            set_idx_bool(&mut base, frame_indexes.frame_has_event, false);
+            set_idx_i32(&mut base, frame_indexes.frame_event_count, 0);
             rows.push(base);
             if rows.len() >= FRAME_PARQUET_ROW_GROUP_SIZE {
                 write_arrow_batch(
@@ -2652,22 +3478,125 @@ fn write_frames_parquet(path: &Path, game_id: &str, replay: &Replay) -> Result<(
     Ok(())
 }
 
+fn materialize_frame_rows_for_benchmark(
+    game_id: &str,
+    replay: &Replay,
+    include_events: bool,
+    options: PbpBuildOptions,
+) -> Result<(usize, usize)> {
+    let columns = frame_columns_cached();
+    let column_index = frame_column_index_cached();
+    let column_kinds = frame_column_kinds_cached();
+    let (context, pbp_rows) = if include_events {
+        build_pbp_rows(game_id, replay, options)?
+    } else {
+        (frame_context(replay), Vec::new())
+    };
+    let mut events_by_frame: HashMap<i32, Vec<RowValues>> = HashMap::new();
+    for row in pbp_rows {
+        let frame = row_i32(&row.values, "observed_frame_number")
+            .or_else(|| row_i32(&row.values, "frame_number"));
+        if let Some(frame) = frame {
+            events_by_frame.entry(frame).or_default().push(row.values);
+        }
+    }
+
+    let players = context.players.clone();
+    let team_size = actual_team_size(&players).or_else(|| header_i32(replay, "TeamSize"));
+    let player_static_values = pbp_player_static_values(&players);
+    let frame_indexes = frame_row_indexes(column_index, &players);
+    let mut static_row = vec![None; columns.len()];
+    set_row_value(
+        &mut static_row,
+        column_index,
+        "game_id",
+        game_id.to_string(),
+    );
+    set_row_value(
+        &mut static_row,
+        column_index,
+        "blue_team_name",
+        context.blue_team_name.clone(),
+    );
+    set_row_value(
+        &mut static_row,
+        column_index,
+        "orange_team_name",
+        context.orange_team_name.clone(),
+    );
+    if let Some(size) = team_size {
+        set_row_i32(&mut static_row, column_index, "team_size", size);
+    }
+    for (key, value) in &player_static_values {
+        if let Some(idx) = column_index.get(key) {
+            static_row[*idx] = parse_cell_value(column_kinds[*idx], value);
+        }
+    }
+
+    let mut row_count = 0usize;
+    let mut filled_count = 0usize;
+    for snapshot in &context.frame_states {
+        let mut base = vec![None; columns.len()];
+        set_idx_i32(&mut base, frame_indexes.frame_number, snapshot.frame_number);
+        set_idx_i32(
+            &mut base,
+            frame_indexes.observed_frame_number,
+            snapshot.frame_number,
+        );
+        if let Some(seconds) = snapshot.seconds_elapsed {
+            set_idx_f32(&mut base, frame_indexes.seconds_elapsed, seconds);
+        }
+        add_frame_state_values_row_indexed(&mut base, &frame_indexes, snapshot);
+        add_spatial_features_row_indexed(&mut base, &frame_indexes, snapshot, &players);
+
+        if let Some(events) = events_by_frame.get(&snapshot.frame_number) {
+            for event in events {
+                let mut values = base.clone();
+                overlay_event_values(&mut values, event);
+                set_idx_bool(&mut values, frame_indexes.frame_has_event, true);
+                set_idx_i32(
+                    &mut values,
+                    frame_indexes.frame_event_count,
+                    events.len() as i32,
+                );
+                row_count += 1;
+                filled_count += filled_cell_count(&values, &static_row);
+            }
+        } else {
+            set_idx_bool(&mut base, frame_indexes.frame_has_event, false);
+            set_idx_i32(&mut base, frame_indexes.frame_event_count, 0);
+            row_count += 1;
+            filled_count += filled_cell_count(&base, &static_row);
+        }
+    }
+
+    Ok((row_count, filled_count))
+}
+
 fn write_csv_row<W: Write>(
     writer: &mut csv::Writer<W>,
     row: &[Option<CellValue>],
     static_defaults: &[Option<CellValue>],
+    record: &mut csv::StringRecord,
 ) -> Result<()> {
-    let record = (0..row.len())
-        .map(|idx| match cell_at(row, static_defaults, idx) {
-            Some(CellValue::Utf8(value)) => value.clone(),
-            Some(CellValue::Int32(value)) => value.to_string(),
-            Some(CellValue::Float32(value)) => value.to_string(),
-            Some(CellValue::Boolean(value)) => value.to_string(),
-            None => String::new(),
-        })
-        .collect::<Vec<_>>();
-    writer.write_record(record)?;
+    record.clear();
+    for idx in 0..row.len() {
+        match cell_at(row, static_defaults, idx) {
+            Some(CellValue::Utf8(value)) => record.push_field(value),
+            Some(CellValue::Int32(value)) => record.push_field(&value.to_string()),
+            Some(CellValue::Float32(value)) => record.push_field(&value.to_string()),
+            Some(CellValue::Boolean(value)) => record.push_field(&value.to_string()),
+            None => record.push_field(""),
+        }
+    }
+    writer.write_record(record.iter())?;
     Ok(())
+}
+
+fn filled_cell_count(row: &[Option<CellValue>], static_defaults: &[Option<CellValue>]) -> usize {
+    (0..row.len())
+        .filter(|idx| cell_at(row, static_defaults, *idx).is_some())
+        .count()
 }
 
 fn pbp_columns_cached() -> &'static Vec<String> {
@@ -2688,6 +3617,48 @@ fn pbp_column_kinds_cached() -> &'static Vec<ColumnKind> {
             .map(|column| column_kind(column))
             .collect()
     })
+}
+
+fn frame_columns_cached() -> &'static Vec<String> {
+    static FRAME_COLUMNS: OnceLock<Vec<String>> = OnceLock::new();
+    FRAME_COLUMNS.get_or_init(|| {
+        let mut columns = pbp_columns();
+        for column in ["frame_has_event", "frame_event_count"] {
+            if !columns.iter().any(|existing| existing == column) {
+                columns.push(column.to_string());
+            }
+        }
+        columns
+    })
+}
+
+fn frame_column_index_cached() -> &'static HashMap<String, usize> {
+    static FRAME_COLUMN_INDEX: OnceLock<HashMap<String, usize>> = OnceLock::new();
+    FRAME_COLUMN_INDEX.get_or_init(|| column_index(frame_columns_cached()))
+}
+
+fn frame_column_kinds_cached() -> &'static Vec<ColumnKind> {
+    static FRAME_COLUMN_KINDS: OnceLock<Vec<ColumnKind>> = OnceLock::new();
+    FRAME_COLUMN_KINDS.get_or_init(|| {
+        frame_columns_cached()
+            .iter()
+            .map(|column| column_kind(column))
+            .collect()
+    })
+}
+
+fn frame_schema_cached() -> Arc<Schema> {
+    static FRAME_SCHEMA: OnceLock<Arc<Schema>> = OnceLock::new();
+    FRAME_SCHEMA
+        .get_or_init(|| {
+            Arc::new(Schema::new(
+                frame_columns_cached()
+                    .iter()
+                    .map(|column| Field::new(column, arrow_data_type(column_kind(column)), true))
+                    .collect::<Vec<_>>(),
+            ))
+        })
+        .clone()
 }
 
 fn column_index(columns: &[String]) -> HashMap<String, usize> {
@@ -2760,7 +3731,10 @@ fn boolean_column(column: &str) -> bool {
         || column.ends_with("_intercept_requires_aerial")
         || matches!(
             column,
-            "pass_in_play"
+            "off_pass"
+                | "off_fake"
+                | "off_whiff"
+                | "off_rotation_cut"
                 | "aerialing"
                 | "air_dribble"
                 | "ground_dribble"
@@ -2791,7 +3765,18 @@ fn int_column(column: &str) -> bool {
         || column.ends_with("_collect")
         || column.ends_with("_throttle")
         || column.ends_with("_steer")
+        || column.ends_with("_rotation_role")
         || column.ends_with("_title_id")
+        || column.ends_with("_score")
+        || column.ends_with("_decal_id")
+        || column.ends_with("_wheels_id")
+        || column.ends_with("_antenna_id")
+        || column.ends_with("_topper_id")
+        || column.ends_with("_engine_audio_id")
+        || column.ends_with("_trail_id")
+        || column.ends_with("_goal_explosion_id")
+        || column.ends_with("_primary_paint_finish_id")
+        || column.ends_with("_accent_paint_finish_id")
         || column.ends_with("_first_frame_in_game")
         || column.ends_with("_time_in_game")
         || column.ends_with("_air_activate_count")
@@ -2820,54 +3805,6 @@ fn set_row_i32(
     }
 }
 
-fn set_row_f32(
-    row: &mut [Option<CellValue>],
-    column_index: &HashMap<String, usize>,
-    column: &str,
-    value: f32,
-) {
-    if let Some(idx) = column_index.get(column) {
-        if value.is_finite() {
-            row[*idx] = Some(CellValue::Float32(value));
-        }
-    }
-}
-
-fn set_row_bool(
-    row: &mut [Option<CellValue>],
-    column_index: &HashMap<String, usize>,
-    column: &str,
-    value: bool,
-) {
-    if let Some(idx) = column_index.get(column) {
-        row[*idx] = Some(CellValue::Boolean(value));
-    }
-}
-
-fn set_row_opt_i32(
-    row: &mut [Option<CellValue>],
-    column_index: &HashMap<String, usize>,
-    column: &str,
-    value: Option<i32>,
-) {
-    if let Some(value) = value {
-        set_row_i32(row, column_index, column, value);
-    }
-}
-
-fn set_row_float(
-    row: &mut [Option<CellValue>],
-    column_index: &HashMap<String, usize>,
-    column: &str,
-    value: Option<f32>,
-) {
-    if let Some(value) = value {
-        if value.is_finite() {
-            set_row_f32(row, column_index, column, value);
-        }
-    }
-}
-
 fn parse_cell_value(kind: ColumnKind, value: &str) -> Option<CellValue> {
     if value.is_empty() {
         return None;
@@ -2892,157 +3829,288 @@ fn overlay_event_values(row: &mut [Option<CellValue>], values: &RowValues) {
     }
 }
 
-fn add_entity_state_row(
-    row: &mut [Option<CellValue>],
+#[derive(Clone, Debug, Default)]
+struct EntityColumnIndexes {
+    pos_x: Option<usize>,
+    pos_y: Option<usize>,
+    pos_z: Option<usize>,
+    vel_x: Option<usize>,
+    vel_y: Option<usize>,
+    vel_z: Option<usize>,
+    ang_vel_x: Option<usize>,
+    ang_vel_y: Option<usize>,
+    ang_vel_z: Option<usize>,
+    rot_x: Option<usize>,
+    rot_y: Option<usize>,
+    rot_z: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PlayerColumnIndexes {
+    entity: EntityColumnIndexes,
+    boost_raw: Option<usize>,
+    boost: Option<usize>,
+    boost_active: Option<usize>,
+    boost_collect: Option<usize>,
+    throttle: Option<usize>,
+    steer: Option<usize>,
+    handbrake: Option<usize>,
+    ball_cam: Option<usize>,
+    dodge_active: Option<usize>,
+    jump_active: Option<usize>,
+    double_jump_active: Option<usize>,
+    jumped: Option<usize>,
+    flipped: Option<usize>,
+    jump_air_activate_count: Option<usize>,
+    double_jump_air_activate_count: Option<usize>,
+    dodge_air_activate_count: Option<usize>,
+    dodges_refreshed_counter: Option<usize>,
+    supersonic: Option<usize>,
+    distance_to_ball: Option<usize>,
+    angle_to_ball: Option<usize>,
+    distance_to_own_net: Option<usize>,
+    angle_to_own_net: Option<usize>,
+    distance_to_opp_net: Option<usize>,
+    angle_to_opp_net: Option<usize>,
+    rotation_role: Option<usize>,
+    distance_to_players: Vec<Option<usize>>,
+}
+
+#[derive(Clone, Debug)]
+struct FrameColumnIndexes {
+    frame_number: Option<usize>,
+    observed_frame_number: Option<usize>,
+    seconds_elapsed: Option<usize>,
+    frame_has_event: Option<usize>,
+    frame_event_count: Option<usize>,
+    ball: EntityColumnIndexes,
+    players: Vec<PlayerColumnIndexes>,
+}
+
+fn frame_row_indexes(
+    column_index: &HashMap<String, usize>,
+    players: &[PlayerInfo],
+) -> FrameColumnIndexes {
+    FrameColumnIndexes {
+        frame_number: column_index.get("frame_number").copied(),
+        observed_frame_number: column_index.get("observed_frame_number").copied(),
+        seconds_elapsed: column_index.get("seconds_elapsed").copied(),
+        frame_has_event: column_index.get("frame_has_event").copied(),
+        frame_event_count: column_index.get("frame_event_count").copied(),
+        ball: entity_column_indexes(column_index, "ball"),
+        players: players
+            .iter()
+            .map(|player| player_column_indexes(column_index, players, player))
+            .collect(),
+    }
+}
+
+fn entity_column_indexes(
     column_index: &HashMap<String, usize>,
     prefix: &str,
+) -> EntityColumnIndexes {
+    EntityColumnIndexes {
+        pos_x: column_index.get(&format!("{prefix}_pos_x")).copied(),
+        pos_y: column_index.get(&format!("{prefix}_pos_y")).copied(),
+        pos_z: column_index.get(&format!("{prefix}_pos_z")).copied(),
+        vel_x: column_index.get(&format!("{prefix}_vel_x")).copied(),
+        vel_y: column_index.get(&format!("{prefix}_vel_y")).copied(),
+        vel_z: column_index.get(&format!("{prefix}_vel_z")).copied(),
+        ang_vel_x: column_index.get(&format!("{prefix}_ang_vel_x")).copied(),
+        ang_vel_y: column_index.get(&format!("{prefix}_ang_vel_y")).copied(),
+        ang_vel_z: column_index.get(&format!("{prefix}_ang_vel_z")).copied(),
+        rot_x: column_index.get(&format!("{prefix}_rot_x")).copied(),
+        rot_y: column_index.get(&format!("{prefix}_rot_y")).copied(),
+        rot_z: column_index.get(&format!("{prefix}_rot_z")).copied(),
+    }
+}
+
+fn player_column_indexes(
+    column_index: &HashMap<String, usize>,
+    players: &[PlayerInfo],
+    player: &PlayerInfo,
+) -> PlayerColumnIndexes {
+    let slot = &player.slot;
+    PlayerColumnIndexes {
+        entity: entity_column_indexes(column_index, slot),
+        boost_raw: column_index.get(&format!("{slot}_boost_raw")).copied(),
+        boost: column_index.get(&format!("{slot}_boost")).copied(),
+        boost_active: column_index.get(&format!("{slot}_boost_active")).copied(),
+        boost_collect: column_index.get(&format!("{slot}_boost_collect")).copied(),
+        throttle: column_index.get(&format!("{slot}_throttle")).copied(),
+        steer: column_index.get(&format!("{slot}_steer")).copied(),
+        handbrake: column_index.get(&format!("{slot}_handbrake")).copied(),
+        ball_cam: column_index.get(&format!("{slot}_ball_cam")).copied(),
+        dodge_active: column_index.get(&format!("{slot}_dodge_active")).copied(),
+        jump_active: column_index.get(&format!("{slot}_jump_active")).copied(),
+        double_jump_active: column_index
+            .get(&format!("{slot}_double_jump_active"))
+            .copied(),
+        jumped: column_index.get(&format!("{slot}_jumped")).copied(),
+        flipped: column_index.get(&format!("{slot}_flipped")).copied(),
+        jump_air_activate_count: column_index
+            .get(&format!("{slot}_jump_air_activate_count"))
+            .copied(),
+        double_jump_air_activate_count: column_index
+            .get(&format!("{slot}_double_jump_air_activate_count"))
+            .copied(),
+        dodge_air_activate_count: column_index
+            .get(&format!("{slot}_dodge_air_activate_count"))
+            .copied(),
+        dodges_refreshed_counter: column_index
+            .get(&format!("{slot}_dodges_refreshed_counter"))
+            .copied(),
+        supersonic: column_index.get(&format!("{slot}_supersonic")).copied(),
+        distance_to_ball: column_index
+            .get(&format!("{slot}_distance_to_ball"))
+            .copied(),
+        angle_to_ball: column_index.get(&format!("{slot}_angle_to_ball")).copied(),
+        distance_to_own_net: column_index
+            .get(&format!("{slot}_distance_to_own_net"))
+            .copied(),
+        angle_to_own_net: column_index
+            .get(&format!("{slot}_angle_to_own_net"))
+            .copied(),
+        distance_to_opp_net: column_index
+            .get(&format!("{slot}_distance_to_opp_net"))
+            .copied(),
+        angle_to_opp_net: column_index
+            .get(&format!("{slot}_angle_to_opp_net"))
+            .copied(),
+        rotation_role: column_index.get(&format!("{slot}_rotation_role")).copied(),
+        distance_to_players: players
+            .iter()
+            .map(|target| {
+                if target.slot == *slot {
+                    None
+                } else {
+                    column_index
+                        .get(&format!("{slot}_distance_to_{}", target.slot))
+                        .copied()
+                }
+            })
+            .collect(),
+    }
+}
+
+fn set_idx_i32(row: &mut [Option<CellValue>], idx: Option<usize>, value: i32) {
+    if let Some(idx) = idx {
+        row[idx] = Some(CellValue::Int32(value));
+    }
+}
+
+fn set_idx_f32(row: &mut [Option<CellValue>], idx: Option<usize>, value: f32) {
+    if let Some(idx) = idx {
+        if value.is_finite() {
+            row[idx] = Some(CellValue::Float32(value));
+        }
+    }
+}
+
+fn set_idx_opt_i32(row: &mut [Option<CellValue>], idx: Option<usize>, value: Option<i32>) {
+    if let Some(value) = value {
+        set_idx_i32(row, idx, value);
+    }
+}
+
+fn set_idx_opt_f32(row: &mut [Option<CellValue>], idx: Option<usize>, value: Option<f32>) {
+    if let Some(value) = value {
+        set_idx_f32(row, idx, value);
+    }
+}
+
+fn set_idx_bool(row: &mut [Option<CellValue>], idx: Option<usize>, value: bool) {
+    if let Some(idx) = idx {
+        row[idx] = Some(CellValue::Boolean(value));
+    }
+}
+
+fn add_entity_state_row_indexed(
+    row: &mut [Option<CellValue>],
+    columns: &EntityColumnIndexes,
     state: EntityState,
 ) {
     if !state.has_pos {
         return;
     }
-    set_row_f32(row, column_index, &format!("{prefix}_pos_x"), state.pos.x);
-    set_row_f32(row, column_index, &format!("{prefix}_pos_y"), state.pos.y);
-    set_row_f32(row, column_index, &format!("{prefix}_pos_z"), state.pos.z);
-    set_row_f32(row, column_index, &format!("{prefix}_vel_x"), state.vel.x);
-    set_row_f32(row, column_index, &format!("{prefix}_vel_y"), state.vel.y);
-    set_row_f32(row, column_index, &format!("{prefix}_vel_z"), state.vel.z);
-    set_row_f32(
-        row,
-        column_index,
-        &format!("{prefix}_ang_vel_x"),
-        state.ang_vel.x,
-    );
-    set_row_f32(
-        row,
-        column_index,
-        &format!("{prefix}_ang_vel_y"),
-        state.ang_vel.y,
-    );
-    set_row_f32(
-        row,
-        column_index,
-        &format!("{prefix}_ang_vel_z"),
-        state.ang_vel.z,
-    );
-    set_row_f32(row, column_index, &format!("{prefix}_rot_x"), state.rot.x);
-    set_row_f32(row, column_index, &format!("{prefix}_rot_y"), state.rot.y);
-    set_row_f32(row, column_index, &format!("{prefix}_rot_z"), state.rot.z);
+    set_idx_f32(row, columns.pos_x, state.pos.x);
+    set_idx_f32(row, columns.pos_y, state.pos.y);
+    set_idx_f32(row, columns.pos_z, state.pos.z);
+    set_idx_f32(row, columns.vel_x, state.vel.x);
+    set_idx_f32(row, columns.vel_y, state.vel.y);
+    set_idx_f32(row, columns.vel_z, state.vel.z);
+    set_idx_f32(row, columns.ang_vel_x, state.ang_vel.x);
+    set_idx_f32(row, columns.ang_vel_y, state.ang_vel.y);
+    set_idx_f32(row, columns.ang_vel_z, state.ang_vel.z);
+    set_idx_f32(row, columns.rot_x, state.rot.x);
+    set_idx_f32(row, columns.rot_y, state.rot.y);
+    set_idx_f32(row, columns.rot_z, state.rot.z);
 }
 
-fn add_frame_state_values_row(
+fn add_frame_state_values_row_indexed(
     row: &mut [Option<CellValue>],
-    column_index: &HashMap<String, usize>,
+    indexes: &FrameColumnIndexes,
     snapshot: &FrameSnapshot,
-    players: &[PlayerInfo],
 ) {
     if let Some(ball) = snapshot.ball {
-        add_entity_state_row(row, column_index, "ball", ball);
+        add_entity_state_row_indexed(row, &indexes.ball, ball);
     }
-    for (idx, player) in players.iter().enumerate() {
+    for (idx, player_indexes) in indexes.players.iter().enumerate() {
         if let Some(state) = snapshot.players.get(idx).and_then(Option::as_ref) {
-            let slot = &player.slot;
-            add_entity_state_row(row, column_index, slot, state.entity);
-            set_row_opt_i32(
+            add_entity_state_row_indexed(row, &player_indexes.entity, state.entity);
+            set_idx_opt_i32(row, player_indexes.boost_raw, state.boost.map(i32::from));
+            set_idx_opt_i32(
                 row,
-                column_index,
-                &format!("{slot}_boost_raw"),
-                state.boost.map(i32::from),
-            );
-            set_row_opt_i32(
-                row,
-                column_index,
-                &format!("{slot}_boost"),
+                player_indexes.boost,
                 state.boost.map(i32::from).map(boost_units),
             );
-            set_row_bool(
+            set_idx_bool(row, player_indexes.boost_active, state.boost_active);
+            set_idx_opt_i32(
                 row,
-                column_index,
-                &format!("{slot}_boost_active"),
-                state.boost_active,
-            );
-            set_row_opt_i32(
-                row,
-                column_index,
-                &format!("{slot}_boost_collect"),
+                player_indexes.boost_collect,
                 state.boost_collect.map(i32::from),
             );
-            set_row_opt_i32(
+            set_idx_opt_i32(row, player_indexes.throttle, state.throttle);
+            set_idx_opt_i32(row, player_indexes.steer, state.steer);
+            set_idx_bool(row, player_indexes.handbrake, state.handbrake);
+            set_idx_bool(row, player_indexes.ball_cam, state.ball_cam);
+            set_idx_bool(row, player_indexes.dodge_active, state.dodge_active);
+            set_idx_bool(row, player_indexes.jump_active, state.jump_active);
+            set_idx_bool(
                 row,
-                column_index,
-                &format!("{slot}_throttle"),
-                state.throttle,
-            );
-            set_row_opt_i32(row, column_index, &format!("{slot}_steer"), state.steer);
-            set_row_bool(
-                row,
-                column_index,
-                &format!("{slot}_handbrake"),
-                state.handbrake,
-            );
-            set_row_bool(
-                row,
-                column_index,
-                &format!("{slot}_ball_cam"),
-                state.ball_cam,
-            );
-            set_row_bool(
-                row,
-                column_index,
-                &format!("{slot}_dodge_active"),
-                state.dodge_active,
-            );
-            set_row_bool(
-                row,
-                column_index,
-                &format!("{slot}_jump_active"),
-                state.jump_active,
-            );
-            set_row_bool(
-                row,
-                column_index,
-                &format!("{slot}_double_jump_active"),
+                player_indexes.double_jump_active,
                 state.double_jump_active,
             );
-            set_row_bool(row, column_index, &format!("{slot}_jumped"), state.jumped);
-            set_row_bool(row, column_index, &format!("{slot}_flipped"), state.flipped);
-            set_row_opt_i32(
+            set_idx_bool(row, player_indexes.jumped, state.jumped);
+            set_idx_bool(row, player_indexes.flipped, state.flipped);
+            set_idx_opt_i32(
                 row,
-                column_index,
-                &format!("{slot}_jump_air_activate_count"),
+                player_indexes.jump_air_activate_count,
                 state.jump_air_activate_count,
             );
-            set_row_opt_i32(
+            set_idx_opt_i32(
                 row,
-                column_index,
-                &format!("{slot}_double_jump_air_activate_count"),
+                player_indexes.double_jump_air_activate_count,
                 state.double_jump_air_activate_count,
             );
-            set_row_opt_i32(
+            set_idx_opt_i32(
                 row,
-                column_index,
-                &format!("{slot}_dodge_air_activate_count"),
+                player_indexes.dodge_air_activate_count,
                 state.dodge_air_activate_count,
             );
-            set_row_opt_i32(
+            set_idx_opt_i32(
                 row,
-                column_index,
-                &format!("{slot}_dodges_refreshed_counter"),
+                player_indexes.dodges_refreshed_counter,
                 state.dodges_refreshed_counter,
             );
-            set_row_bool(
-                row,
-                column_index,
-                &format!("{slot}_supersonic"),
-                state.supersonic,
-            );
+            set_idx_bool(row, player_indexes.supersonic, state.supersonic);
         }
     }
 }
 
-fn add_spatial_features_row(
+fn add_spatial_features_row_indexed(
     row: &mut [Option<CellValue>],
-    column_index: &HashMap<String, usize>,
+    indexes: &FrameColumnIndexes,
     snapshot: &FrameSnapshot,
     players: &[PlayerInfo],
 ) {
@@ -3062,56 +4130,61 @@ fn add_spatial_features_row(
         })
         .collect::<Vec<_>>();
     for (idx, player) in players.iter().enumerate() {
-        let slot = &player.slot;
+        let player_indexes = &indexes.players[idx];
         let pos = positions[idx];
         let own_net = defensive_net(player.team);
         let opp_net = offensive_net(player.team);
-        set_row_float(
+        set_idx_opt_f32(
             row,
-            column_index,
-            &format!("{slot}_distance_to_ball"),
+            player_indexes.distance_to_ball,
             distance_opt(pos, ball),
         );
-        set_row_float(
+        set_idx_opt_f32(row, player_indexes.angle_to_ball, angle_opt(pos, ball));
+        set_idx_opt_f32(
             row,
-            column_index,
-            &format!("{slot}_angle_to_ball"),
-            angle_opt(pos, ball),
-        );
-        set_row_float(
-            row,
-            column_index,
-            &format!("{slot}_distance_to_own_net"),
+            player_indexes.distance_to_own_net,
             distance_opt(pos, own_net),
         );
-        set_row_float(
+        set_idx_opt_f32(
             row,
-            column_index,
-            &format!("{slot}_angle_to_own_net"),
+            player_indexes.angle_to_own_net,
             angle_opt(pos, own_net),
         );
-        set_row_float(
+        set_idx_opt_f32(
             row,
-            column_index,
-            &format!("{slot}_distance_to_opp_net"),
+            player_indexes.distance_to_opp_net,
             distance_opt(pos, opp_net),
         );
-        set_row_float(
+        set_idx_opt_f32(
             row,
-            column_index,
-            &format!("{slot}_angle_to_opp_net"),
+            player_indexes.angle_to_opp_net,
             angle_opt(pos, opp_net),
         );
+        if let (Some(pos), Some(ball)) = (pos, ball) {
+            let player_ball_distance = vec_distance(pos, ball);
+            let mut closer_teammates = 0;
+            for (other_idx, other) in players.iter().enumerate() {
+                if other.slot == player.slot || other.team != player.team {
+                    continue;
+                }
+                let Some(other_pos) = positions[other_idx] else {
+                    continue;
+                };
+                if vec_distance(other_pos, ball) < player_ball_distance {
+                    closer_teammates += 1;
+                }
+            }
+            set_idx_i32(row, player_indexes.rotation_role, closer_teammates + 1);
+        }
     }
-    for (source_idx, source) in players.iter().enumerate() {
-        for (target_idx, target) in players.iter().enumerate() {
+    for (source_idx, source_indexes) in indexes.players.iter().enumerate() {
+        for (target_idx, column) in source_indexes.distance_to_players.iter().enumerate() {
             if source_idx == target_idx {
                 continue;
             }
-            set_row_float(
+            set_idx_opt_f32(
                 row,
-                column_index,
-                &format!("{}_distance_to_{}", source.slot, target.slot),
+                *column,
                 distance_opt(positions[source_idx], positions[target_idx]),
             );
         }
@@ -3126,39 +4199,39 @@ fn write_arrow_batch<W: Write + Send>(
     static_defaults: &[Option<CellValue>],
 ) -> Result<()> {
     let column_count = schema.fields().len();
-    let mut arrays = Vec::with_capacity(column_count);
-    for column_idx in 0..column_count {
-        match column_kinds[column_idx] {
+    let arrays = (0..column_count)
+        .into_par_iter()
+        .map(|column_idx| match column_kinds[column_idx] {
             ColumnKind::Utf8 => {
                 let values = rows
                     .iter()
                     .map(|row| cell_utf8(cell_at(row, static_defaults, column_idx)))
                     .collect::<Vec<_>>();
-                arrays.push(Arc::new(StringArray::from(values)) as ArrayRef);
+                Arc::new(StringArray::from(values)) as ArrayRef
             }
             ColumnKind::Int32 => {
                 let values = rows
                     .iter()
                     .map(|row| cell_i32(cell_at(row, static_defaults, column_idx)))
                     .collect::<Vec<_>>();
-                arrays.push(Arc::new(Int32Array::from(values)) as ArrayRef);
+                Arc::new(Int32Array::from(values)) as ArrayRef
             }
             ColumnKind::Float32 => {
                 let values = rows
                     .iter()
                     .map(|row| cell_f32(cell_at(row, static_defaults, column_idx)))
                     .collect::<Vec<_>>();
-                arrays.push(Arc::new(Float32Array::from(values)) as ArrayRef);
+                Arc::new(Float32Array::from(values)) as ArrayRef
             }
             ColumnKind::Boolean => {
                 let values = rows
                     .iter()
                     .map(|row| cell_bool(cell_at(row, static_defaults, column_idx)))
                     .collect::<Vec<_>>();
-                arrays.push(Arc::new(BooleanArray::from(values)) as ArrayRef);
+                Arc::new(BooleanArray::from(values)) as ArrayRef
             }
-        }
-    }
+        })
+        .collect::<Vec<_>>();
     let batch = RecordBatch::try_new(schema, arrays)?;
     writer.write(&batch)?;
     Ok(())
@@ -3268,11 +4341,24 @@ fn pbp_players(replay: &Replay) -> Vec<PlayerInfo> {
                 is_bot: prop_bool(player, "bBot")
                     .map(|value| value.to_string())
                     .unwrap_or_default(),
+                score: prop_i32(player, "Score")
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
                 title_id: String::new(),
                 first_frame_in_game: String::new(),
                 time_in_game: String::new(),
                 car_id: String::new(),
                 car_name: String::new(),
+                decal_id: String::new(),
+                wheels_id: String::new(),
+                boost_id: String::new(),
+                antenna_id: String::new(),
+                topper_id: String::new(),
+                engine_audio_id: String::new(),
+                trail_id: String::new(),
+                goal_explosion_id: String::new(),
+                primary_paint_finish_id: String::new(),
+                accent_paint_finish_id: String::new(),
                 camera_settings: None,
             });
         }
@@ -3298,7 +4384,16 @@ fn pbp_players(replay: &Replay) -> Vec<PlayerInfo> {
     players
 }
 
+fn frame_context(replay: &Replay) -> PbpContext {
+    replay_context(replay, ContextMode::FramesOnly)
+}
+
 fn pbp_context(replay: &Replay) -> PbpContext {
+    replay_context(replay, ContextMode::Full)
+}
+
+fn replay_context(replay: &Replay, mode: ContextMode) -> PbpContext {
+    let include_events = mode == ContextMode::Full;
     let mut context = PbpContext {
         playlist: header_string(replay, "Playlist").unwrap_or_default(),
         players: pbp_players(replay),
@@ -3364,9 +4459,11 @@ fn pbp_context(replay: &Replay) -> PbpContext {
                                 .get(&updated_actor.actor_id.0)
                                 .copied();
                         }
-                        for (car_actor, pri_actor) in &car_pri {
-                            if *pri_actor == updated_actor.actor_id.0 {
-                                car_player_name.insert(*car_actor, value.clone());
+                        let mut car_actors = car_pri.keys().copied().collect::<Vec<_>>();
+                        car_actors.sort_unstable();
+                        for car_actor in car_actors {
+                            if car_pri.get(&car_actor).copied() == Some(updated_actor.actor_id.0) {
+                                car_player_name.insert(car_actor, value.clone());
                             }
                         }
                         flush_pending_official_stats(
@@ -3432,8 +4529,8 @@ fn pbp_context(replay: &Replay) -> PbpContext {
                     ("TAGame.CameraSettingsActor_TA:PRI", Attribute::ActiveActor(value)) => {
                         if value.active {
                             camera_actor_pri.insert(updated_actor.actor_id.0, value.actor.0);
-                            if let Some(settings) = pending_camera_settings
-                                .remove(&updated_actor.actor_id.0)
+                            if let Some(settings) =
+                                pending_camera_settings.remove(&updated_actor.actor_id.0)
                             {
                                 camera_settings_by_pri.insert(value.actor.0, settings);
                                 if let Some(player) = context_player_mut(
@@ -3455,11 +4552,9 @@ fn pbp_context(replay: &Replay) -> PbpContext {
                             camera_actor_pri.get(&updated_actor.actor_id.0).copied()
                         {
                             camera_settings_by_pri.insert(pri_actor_id, settings);
-                            if let Some(player) = context_player_mut(
-                                &mut context.players,
-                                pri_actor_id,
-                                &pri_name,
-                            ) {
+                            if let Some(player) =
+                                context_player_mut(&mut context.players, pri_actor_id, &pri_name)
+                            {
                                 player.camera_settings = Some(settings);
                             }
                         } else {
@@ -3492,23 +4587,25 @@ fn pbp_context(replay: &Replay) -> PbpContext {
                         if let Some(state) = entity_state_from_attribute(attribute) {
                             if ball_actors.contains_key(&updated_actor.actor_id.0) {
                                 latest_ball_state = Some(state);
-                                if let Some(previous) = previous_ball_ang_vel {
-                                    if vec_changed(previous, state.ang_vel) {
-                                        if let Some(candidate) = closest_ball_hit_candidate(
-                                            i32::try_from(frame_number).unwrap_or(i32::MAX),
-                                            state,
-                                            latest_hit_team,
-                                            &context.players,
-                                            &pri_name,
-                                            &car_pri,
-                                            &latest_car_states,
-                                            &goal_frames,
-                                        ) {
-                                            hit_candidates.push(candidate);
+                                if include_events {
+                                    if let Some(previous) = previous_ball_ang_vel {
+                                        if vec_changed(previous, state.ang_vel) {
+                                            if let Some(candidate) = closest_ball_hit_candidate(
+                                                i32::try_from(frame_number).unwrap_or(i32::MAX),
+                                                state,
+                                                latest_hit_team,
+                                                &context.players,
+                                                &pri_name,
+                                                &car_pri,
+                                                &latest_car_states,
+                                                &goal_frames,
+                                            ) {
+                                                hit_candidates.push(candidate);
+                                            }
                                         }
                                     }
+                                    previous_ball_ang_vel = Some(state.ang_vel);
                                 }
-                                previous_ball_ang_vel = Some(state.ang_vel);
                             } else {
                                 latest_car_states.insert(updated_actor.actor_id.0, state);
                                 if let Some(name) = player_name_for_car(
@@ -3726,7 +4823,7 @@ fn pbp_context(replay: &Replay) -> PbpContext {
                         latest_seconds_remaining = Some(*value);
                     }
                     ("TAGame.GameEvent_Soccar_TA:bBallHasBeenHit", Attribute::Boolean(value)) => {
-                        if *value {
+                        if include_events && *value {
                             if let Some(state) = latest_ball_state {
                                 if let Some(candidate) = closest_ball_hit_candidate(
                                     i32::try_from(frame_number).unwrap_or(i32::MAX),
@@ -3837,10 +4934,7 @@ fn pbp_context(replay: &Replay) -> PbpContext {
                             &pri_name,
                         ) {
                             if let Ok(value) = serde_json::to_value(attribute) {
-                                if let Some(car_id) = loadout_body_id(&value, player.team) {
-                                    player.car_id = car_id.to_string();
-                                    player.car_name = car_name(car_id).to_string();
-                                }
+                                assign_player_loadout(player, &value);
                             }
                         }
                     }
@@ -3848,6 +4942,9 @@ fn pbp_context(replay: &Replay) -> PbpContext {
                         "TAGame.Car_TA:ReplicatedDemolishExtended",
                         Attribute::DemolishExtended(value),
                     ) => {
+                        if !include_events {
+                            continue;
+                        }
                         let attacker_name = pri_name
                             .get(&value.attacker_pri.actor.0)
                             .or_else(|| {
@@ -3877,7 +4974,8 @@ fn pbp_context(replay: &Replay) -> PbpContext {
                     _ => {}
                 }
 
-                if attribute_type(&updated_actor.attribute) == "demolish_extended" {
+                if include_events && attribute_type(&updated_actor.attribute) == "demolish_extended"
+                {
                     if let Ok(value) = serde_json::to_value(&updated_actor.attribute) {
                         let attacker_pri = value
                             .get("DemolishExtended")
@@ -3954,26 +5052,30 @@ fn pbp_context(replay: &Replay) -> PbpContext {
     let kickoff_starts = kickoff_start_frames_from_resets(&context.frame_states);
     apply_kickoff_boost_resets(&mut context.frame_states, &kickoff_starts);
     add_inferred_initial_game_joins(&mut context);
-    add_demo_respawn_events(&mut context);
+    if include_events {
+        add_demo_respawn_events(&mut context);
+    }
 
     for player in &mut context.players {
         if player.first_frame_in_game.is_empty() {
             player.first_frame_in_game = "1".to_string();
         }
     }
-    flush_pending_official_stats(
-        &mut context.official_stats,
-        &mut pending_official_stats,
-        &pri_name,
-        None,
-    );
-    dedupe_official_stats(&mut context.official_stats);
-    context.ball_events = classify_ball_events(
-        filter_duplicate_hits(hit_candidates),
-        &context.players,
-        &goal_frames,
-        &kickoff_starts,
-    );
+    if include_events {
+        flush_pending_official_stats(
+            &mut context.official_stats,
+            &mut pending_official_stats,
+            &pri_name,
+            None,
+        );
+        dedupe_official_stats(&mut context.official_stats);
+        context.ball_events = classify_ball_events(
+            filter_duplicate_hits(hit_candidates),
+            &context.players,
+            &goal_frames,
+            &kickoff_starts,
+        );
+    }
     context
 }
 
@@ -4065,7 +5167,6 @@ fn add_game_presence_events(
         }
         add_pbp_players(&mut values, player_static_values);
         add_frame_state_values(&mut values, context, event.frame_number, players);
-        add_spatial_features(&mut values, players);
         rows.push(PbpEventRecord {
             frame_number: Some(event.frame_number),
             event_type: event.event_type.to_string(),
@@ -4176,6 +5277,7 @@ fn record_official_stat(
     for stat_number in (prior + 1)..=value {
         if let Some(player_name) = &player_name {
             official_stats.push(OfficialStatEvent {
+                pri_actor_id: Some(pri_actor_id),
                 frame_number,
                 player_name: player_name.clone(),
                 stat_type,
@@ -4212,6 +5314,7 @@ fn flush_pending_official_stats(
             .filter(|value| !value.is_empty())
         {
             Some(player_name) => official_stats.push(OfficialStatEvent {
+                pri_actor_id: Some(pending.pri_actor_id),
                 frame_number: pending.frame_number,
                 player_name: player_name.clone(),
                 stat_type: pending.stat_type,
@@ -4310,22 +5413,33 @@ fn closest_ball_hit_candidate(
 ) -> Option<HitCandidate> {
     let mut best_name = String::new();
     let mut best_distance = f32::MAX;
-    for (car_actor, pri_actor) in car_pri {
+    let mut player_positions = vec![None; players.len()];
+    let mut car_actors = car_pri.keys().copied().collect::<Vec<_>>();
+    car_actors.sort_unstable();
+    for car_actor in car_actors {
+        let Some(pri_actor) = car_pri.get(&car_actor) else {
+            continue;
+        };
         let name = match pri_name.get(pri_actor) {
             Some(value) => value,
             None => continue,
         };
-        let player = match players.iter().find(|player| &player.name == name) {
+        let (player_idx, player) = match players
+            .iter()
+            .enumerate()
+            .find(|(_, player)| &player.name == name)
+        {
             Some(value) => value,
             None => continue,
         };
         if hit_team.map(|team| team != player.team).unwrap_or(false) {
             continue;
         }
-        let car_state = match car_states.get(car_actor) {
+        let car_state = match car_states.get(&car_actor) {
             Some(value) if value.has_pos => *value,
             _ => continue,
         };
+        player_positions[player_idx] = Some(car_state.pos);
         let distance = ball_collision_distance(
             ball_state.pos,
             car_state,
@@ -4342,6 +5456,7 @@ fn closest_ball_hit_candidate(
             player_name: best_name,
             collision_distance: best_distance,
             ball_state,
+            player_positions,
             goal_number: goal_number_for_frame(frame_number, goal_frames),
         })
     } else {
@@ -4350,7 +5465,12 @@ fn closest_ball_hit_candidate(
 }
 
 fn filter_duplicate_hits(mut hits: Vec<HitCandidate>) -> Vec<HitCandidate> {
-    hits.sort_by_key(|hit| hit.frame_number);
+    hits.sort_by(|left, right| {
+        left.frame_number
+            .cmp(&right.frame_number)
+            .then_with(|| left.player_name.cmp(&right.player_name))
+            .then_with(|| left.collision_distance.total_cmp(&right.collision_distance))
+    });
     let mut output = Vec::new();
     let mut idx = 0;
     while idx < hits.len() {
@@ -4395,8 +5515,11 @@ fn classify_ball_events(
             next_hit_frame_number: None,
             goal_number: hit.goal_number,
             ball_state: hit.ball_state,
+            player_positions: hit.player_positions,
             goal: false,
             shot: false,
+            missed_shot: false,
+            missed_pass: false,
             pass_: false,
             clear: false,
             save: false,
@@ -4457,6 +5580,13 @@ fn classify_ball_events(
         }
         events[idx].distance_to_goal = distance_to_goal(&events[idx], players);
         events[idx].shot = is_shot(&events[idx], players) || events[idx].goal;
+        events[idx].missed_shot = !events[idx].shot && is_missed_shot(&events[idx], players);
+        if !events[idx].pass_ && !events[idx].shot && !events[idx].missed_shot {
+            if let Some(target_name) = missed_pass_target(&events[idx], players) {
+                events[idx].missed_pass = true;
+                events[idx].player_2_name = target_name;
+            }
+        }
         if events[idx].goal {
             if let Some(pass_idx) = last_passing_idx {
                 events[idx].player_2_name = events[pass_idx].player_name.clone();
@@ -4476,7 +5606,7 @@ fn classify_ball_events(
         }
     }
 
-    let kickoff_event_indices = kickoff_touch_event_indices(&events, kickoff_starts);
+    let kickoff_event_indices = kickoff_touch_event_indices(&events, kickoff_starts, goal_frames);
     let shooter_by_frame = events
         .iter()
         .map(|event| (event.frame_number, event.player_name.clone()))
@@ -4489,6 +5619,10 @@ fn classify_ball_events(
             "goal".to_string()
         } else if event.shot || event.save {
             "shot".to_string()
+        } else if event.missed_shot {
+            "missed-shot".to_string()
+        } else if event.missed_pass {
+            "missed-pass".to_string()
         } else if event.clear {
             "exit".to_string()
         } else if event.pass_ {
@@ -4523,25 +5657,6 @@ fn team_name(team: i32) -> &'static str {
     }
 }
 
-fn player_team_name(name: &str, players: &[PlayerInfo]) -> String {
-    player_team(name, players)
-        .map(team_name)
-        .unwrap_or_default()
-        .to_string()
-}
-
-fn row_event_team(row: &PbpEventRecord, players: &[PlayerInfo]) -> String {
-    let event_team = row_string(&row.values, "event_team");
-    if !event_team.is_empty() {
-        return event_team;
-    }
-    let player_team = row_string(&row.values, "event_player_1_team");
-    if !player_team.is_empty() {
-        return player_team;
-    }
-    player_team_name(&row_string(&row.values, "event_player_1_name"), players)
-}
-
 fn actual_team_size(players: &[PlayerInfo]) -> Option<i32> {
     let blue = players.iter().filter(|player| player.team == 0).count();
     let orange = players.iter().filter(|player| player.team == 1).count();
@@ -4554,9 +5669,14 @@ fn header_actual_team_size(replay: &Replay) -> Option<i32> {
     actual_team_size(&players)
 }
 
-fn kickoff_touch_event_indices(events: &[BallEvent], kickoff_starts: &[i32]) -> HashSet<usize> {
+fn kickoff_touch_event_indices(
+    events: &[BallEvent],
+    kickoff_starts: &[i32],
+    goal_frames: &[(i32, String)],
+) -> HashSet<usize> {
     let mut starts = std::iter::once(0)
         .chain(kickoff_starts.iter().copied())
+        .chain(goal_frames.iter().map(|(frame, _)| frame.saturating_add(1)))
         .collect::<Vec<_>>();
     starts.sort_unstable();
     starts.dedup();
@@ -4707,96 +5827,34 @@ fn apply_official_stats(
     for stat in official_stats {
         match stat.stat_type {
             "shot" | "goal" => {
-                //Official stat is the label; last ball touch is the feature row.
-                let flag_key = format!("official_{}", stat.stat_type);
-                let best_idx = rows
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, row)| {
-                        row.frame_number.is_some()
-                            && row_string(&row.values, "event_player_1_name") == stat.player_name
-                            && is_ball_touch_row(row)
-                            && !truthy(row.values.get(&flag_key))
-                    })
-                    .filter_map(|(idx, row)| {
-                        let frame = row.frame_number?;
-                        (frame <= stat.frame_number).then_some((idx, frame))
-                    })
-                    .max_by_key(|(_, frame)| *frame)
-                    .map(|(idx, _)| idx)
-                    .or_else(|| {
-                        rows.iter()
-                            .enumerate()
-                            .filter(|(_, row)| {
-                                row.frame_number.is_some()
-                                    && row_string(&row.values, "event_player_1_name")
-                                        == stat.player_name
-                                    && is_ball_touch_row(row)
-                            })
-                            .filter_map(|(idx, row)| {
-                                let frame = row.frame_number?;
-                                (frame <= stat.frame_number).then_some((idx, frame))
-                            })
-                            .max_by_key(|(_, frame)| *frame)
-                            .map(|(idx, _)| idx)
-                    });
-                if let Some(idx) = best_idx {
-                    rows[idx]
-                        .values
-                        .insert(format!("official_{}", stat.stat_type), "true".to_string());
-                    increment_official_count(&mut rows[idx].values, stat.stat_type);
-                    set_recorded_frame(&mut rows[idx], stat.frame_number, false);
-                    if stat.stat_type == "goal" || rows[idx].event_type != "goal" {
-                        rows[idx].event_type = stat.stat_type.to_string();
-                        rows[idx]
-                            .values
-                            .insert("event_type".to_string(), stat.stat_type.to_string());
-                    }
-                } else {
-                    rows.push(build_official_stat_row(
-                        stat,
-                        players,
-                        player_static_values,
-                        game_id,
-                        match_guid,
-                        replay_name,
-                        map_id,
-                        context,
-                        team_size,
-                        game_time,
-                    ));
-                }
+                rows.push(build_official_stat_row(
+                    stat,
+                    rows,
+                    players,
+                    player_static_values,
+                    game_id,
+                    match_guid,
+                    replay_name,
+                    map_id,
+                    context,
+                    team_size,
+                    game_time,
+                ));
             }
             "assist" => {
-                //Assists are recorded on the goal frame and tagged onto the matching goal row.
-                let assist_team = player_team(&stat.player_name, players);
-                let best_idx = rows
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, row)| {
-                        if row.event_type != "goal" || row.frame_number.is_none() {
-                            return false;
-                        }
-                        match assist_team {
-                            Some(1) => row_event_team(row, players) == "orange",
-                            Some(_) => row_event_team(row, players) == "blue",
-                            None => true,
-                        }
-                    })
-                    .filter_map(|(idx, row)| {
-                        let delta = (row.frame_number? - stat.frame_number).abs();
-                        (delta <= 300).then_some((idx, delta))
-                    })
-                    .min_by_key(|(_, delta)| *delta)
-                    .map(|(idx, _)| idx);
-                if let Some(idx) = best_idx {
-                    rows[idx]
-                        .values
-                        .insert("official_assist".to_string(), "true".to_string());
-                    increment_official_count(&mut rows[idx].values, stat.stat_type);
-                    set_recorded_frame(&mut rows[idx], stat.frame_number, true);
-                    add_event_player(&mut rows[idx].values, players, 2, &stat.player_name);
-                }
+                rows.push(build_official_assist_row(
+                    stat,
+                    rows,
+                    players,
+                    player_static_values,
+                    game_id,
+                    match_guid,
+                    replay_name,
+                    map_id,
+                    context,
+                    team_size,
+                    game_time,
+                ));
             }
             "save" => {
                 //Save rows keep the recorded save frame while linking back to the observed shot.
@@ -4830,38 +5888,9 @@ fn is_ball_touch_row(row: &PbpEventRecord) -> bool {
         || !row_string(&row.values, "next_hit_frame_number").is_empty())
 }
 
-fn increment_official_count(values: &mut RowValues, stat_type: &str) {
-    let key = format!("official_{stat_type}_count");
-    let value = row_i32(values, &key).unwrap_or(0) + 1;
-    values.insert(key, value.to_string());
-}
-
-fn set_recorded_frame(row: &mut PbpEventRecord, recorded_frame_number: i32, keep_existing: bool) {
-    let observed = row
-        .frame_number
-        .map(|frame| frame.to_string())
-        .unwrap_or_default();
-    if !row.values.contains_key("observed_frame_number") {
-        row.values
-            .insert("observed_frame_number".to_string(), observed);
-    }
-    if keep_existing {
-        if !row.values.contains_key("recorded_frame_number") {
-            row.values.insert(
-                "recorded_frame_number".to_string(),
-                recorded_frame_number.to_string(),
-            );
-        }
-    } else {
-        row.values.insert(
-            "recorded_frame_number".to_string(),
-            recorded_frame_number.to_string(),
-        );
-    }
-}
-
 fn build_official_stat_row(
     stat: &OfficialStatEvent,
+    rows: &[PbpEventRecord],
     players: &[PlayerInfo],
     player_static_values: &[(String, String)],
     game_id: &str,
@@ -4872,6 +5901,8 @@ fn build_official_stat_row(
     team_size: Option<i32>,
     game_time: &str,
 ) -> PbpEventRecord {
+    let player_name = official_stat_player_name(stat, players);
+    let observed_frame = official_observed_frame(rows, &player_name, stat.frame_number, None);
     let mut values = pbp_base_values(
         game_id,
         match_guid,
@@ -4885,7 +5916,7 @@ fn build_official_stat_row(
     values.insert("frame_number".to_string(), stat.frame_number.to_string());
     values.insert(
         "observed_frame_number".to_string(),
-        stat.frame_number.to_string(),
+        observed_frame.to_string(),
     );
     values.insert(
         "recorded_frame_number".to_string(),
@@ -4896,20 +5927,66 @@ fn build_official_stat_row(
         format!("official_{}_count", stat.stat_type),
         "1".to_string(),
     );
-    insert_seconds_elapsed(&mut values, context, stat.frame_number);
-    add_event_player(&mut values, players, 1, &stat.player_name);
-    if let Some(player) = players
-        .iter()
-        .find(|player| player.name == stat.player_name)
-    {
+    insert_seconds_elapsed(&mut values, context, observed_frame);
+    add_event_player(&mut values, players, 1, &player_name);
+    if let Some(player) = players.iter().find(|player| player.name == player_name) {
         values.insert("event_team".to_string(), team_name(player.team).to_string());
     }
     add_pbp_players(&mut values, player_static_values);
-    add_frame_state_values(&mut values, context, stat.frame_number, players);
-    add_spatial_features(&mut values, players);
+    add_frame_state_values(&mut values, context, observed_frame, players);
     PbpEventRecord {
         frame_number: Some(stat.frame_number),
         event_type: stat.stat_type.to_string(),
+        values,
+    }
+}
+
+fn build_official_assist_row(
+    stat: &OfficialStatEvent,
+    rows: &[PbpEventRecord],
+    players: &[PlayerInfo],
+    player_static_values: &[(String, String)],
+    game_id: &str,
+    match_guid: &str,
+    replay_name: &str,
+    map_id: &str,
+    context: &PbpContext,
+    team_size: Option<i32>,
+    game_time: &str,
+) -> PbpEventRecord {
+    let player_name = official_stat_player_name(stat, players);
+    let observed_frame = official_observed_frame(rows, &player_name, stat.frame_number, None);
+    let mut values = pbp_base_values(
+        game_id,
+        match_guid,
+        replay_name,
+        map_id,
+        context,
+        team_size,
+        game_time,
+    );
+    values.insert("event_type".to_string(), "assist".to_string());
+    values.insert("frame_number".to_string(), stat.frame_number.to_string());
+    values.insert(
+        "observed_frame_number".to_string(),
+        observed_frame.to_string(),
+    );
+    values.insert(
+        "recorded_frame_number".to_string(),
+        stat.frame_number.to_string(),
+    );
+    values.insert("official_assist".to_string(), "true".to_string());
+    values.insert("official_assist_count".to_string(), "1".to_string());
+    insert_seconds_elapsed(&mut values, context, observed_frame);
+    add_event_player(&mut values, players, 2, &player_name);
+    if let Some(player) = players.iter().find(|player| player.name == player_name) {
+        values.insert("event_team".to_string(), team_name(player.team).to_string());
+    }
+    add_pbp_players(&mut values, player_static_values);
+    add_frame_state_values(&mut values, context, observed_frame, players);
+    PbpEventRecord {
+        frame_number: Some(stat.frame_number),
+        event_type: "assist".to_string(),
         values,
     }
 }
@@ -4927,24 +6004,18 @@ fn build_official_save_row(
     team_size: Option<i32>,
     game_time: &str,
 ) -> PbpEventRecord {
-    let save_team = player_team(&stat.player_name, players);
+    let player_name = official_stat_player_name(stat, players);
+    let save_team = player_team(&player_name, players);
     let linked_shot = linked_shot_row(rows, save_team, stat.frame_number);
     let min_observed_frame = linked_shot
         .and_then(|row| row.frame_number)
         .unwrap_or(i32::MIN);
-    let observed_frame = rows
-        .iter()
-        .filter(|row| {
-            row.frame_number.is_some()
-                && row_string(&row.values, "event_player_1_name") == stat.player_name
-                && is_ball_touch_row(row)
-        })
-        .filter_map(|row| {
-            let frame = row.frame_number?;
-            (frame >= min_observed_frame && frame <= stat.frame_number).then_some(frame)
-        })
-        .max()
-        .unwrap_or(stat.frame_number);
+    let observed_frame = official_observed_frame(
+        rows,
+        &player_name,
+        stat.frame_number,
+        Some(min_observed_frame),
+    );
     let mut values = pbp_base_values(
         game_id,
         match_guid,
@@ -4955,7 +6026,7 @@ fn build_official_save_row(
         game_time,
     );
     values.insert("event_type".to_string(), "save".to_string());
-    values.insert("frame_number".to_string(), observed_frame.to_string());
+    values.insert("frame_number".to_string(), stat.frame_number.to_string());
     values.insert(
         "observed_frame_number".to_string(),
         observed_frame.to_string(),
@@ -4967,11 +6038,8 @@ fn build_official_save_row(
     values.insert("official_save".to_string(), "true".to_string());
     values.insert("official_save_count".to_string(), "1".to_string());
     insert_seconds_elapsed(&mut values, context, observed_frame);
-    add_event_player(&mut values, players, 1, &stat.player_name);
-    if let Some(player) = players
-        .iter()
-        .find(|player| player.name == stat.player_name)
-    {
+    add_event_player(&mut values, players, 1, &player_name);
+    if let Some(player) = players.iter().find(|player| player.name == player_name) {
         values.insert("event_team".to_string(), team_name(player.team).to_string());
     }
     if let Some(shot) = linked_shot {
@@ -4994,12 +6062,51 @@ fn build_official_save_row(
     }
     add_pbp_players(&mut values, player_static_values);
     add_frame_state_values(&mut values, context, observed_frame, players);
-    add_spatial_features(&mut values, players);
     PbpEventRecord {
-        frame_number: Some(observed_frame),
+        frame_number: Some(stat.frame_number),
         event_type: "save".to_string(),
         values,
     }
+}
+
+fn official_stat_player_name(stat: &OfficialStatEvent, players: &[PlayerInfo]) -> String {
+    stat.pri_actor_id
+        .and_then(|actor_id| {
+            players
+                .iter()
+                .find(|player| player.actor_id.parse::<i32>().ok() == Some(actor_id))
+        })
+        .map(|player| player.name.clone())
+        .unwrap_or_else(|| stat.player_name.clone())
+}
+
+fn official_observed_frame(
+    rows: &[PbpEventRecord],
+    player_name: &str,
+    recorded_frame_number: i32,
+    min_frame: Option<i32>,
+) -> i32 {
+    rows.iter()
+        .filter(|row| {
+            row.frame_number.is_some()
+                && row_string(&row.values, "event_player_1_name") == player_name
+                && is_ball_touch_row(row)
+        })
+        .filter_map(|row| {
+            let frame = row.frame_number?;
+            if frame > recorded_frame_number {
+                return None;
+            }
+            if min_frame
+                .map(|min_frame| frame < min_frame)
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            Some(frame)
+        })
+        .max()
+        .unwrap_or(recorded_frame_number)
 }
 
 fn linked_shot_row(
@@ -5025,396 +6132,8 @@ fn linked_shot_row(
         .map(|(row, _)| row)
 }
 
-fn reconcile_header_stats(
-    rows: &mut Vec<PbpEventRecord>,
-    replay: &Replay,
-    players: &[PlayerInfo],
-    player_static_values: &[(String, String)],
-    game_id: &str,
-    match_guid: &str,
-    replay_name: &str,
-    map_id: &str,
-    context: &PbpContext,
-    team_size: Option<i32>,
-    game_time: &str,
-) {
-    let expected = header_stat_counts(replay);
-    demote_excess_stats_by_header(rows, &expected);
-    for player in players {
-        let expected_counts = expected.get(&player.name).copied().unwrap_or_default();
-        demote_excess_header_stats(rows, player, expected_counts);
-    }
-    for player in players {
-        let expected_counts = expected.get(&player.name).copied().unwrap_or_default();
-        reconcile_player_goals(
-            rows,
-            player,
-            expected_counts.0,
-            replay,
-            players,
-            player_static_values,
-            game_id,
-            match_guid,
-            replay_name,
-            map_id,
-            context,
-            team_size,
-            game_time,
-        );
-        reconcile_player_assists(rows, player, expected_counts.1, players);
-        reconcile_player_saves(
-            rows,
-            player,
-            expected_counts.2,
-            players,
-            player_static_values,
-            game_id,
-            match_guid,
-            replay_name,
-            map_id,
-            context,
-            team_size,
-            game_time,
-        );
-        reconcile_player_shots(
-            rows,
-            player,
-            expected_counts.3,
-            players,
-            player_static_values,
-            game_id,
-            match_guid,
-            replay_name,
-            map_id,
-            context,
-            team_size,
-            game_time,
-        );
-    }
-}
-
-fn demote_excess_stats_by_header(
-    rows: &mut [PbpEventRecord],
-    expected: &HashMap<String, (i32, i32, i32, i32)>,
-) {
-    let mut names = std::collections::HashSet::new();
-    for row in rows.iter() {
-        let player_1 = row_string(&row.values, "event_player_1_name");
-        if !player_1.is_empty() {
-            names.insert(player_1);
-        }
-        let player_2 = row_string(&row.values, "event_player_2_name");
-        if !player_2.is_empty() {
-            names.insert(player_2);
-        }
-    }
-    for name in names {
-        let expected_counts = expected.get(&name).copied().unwrap_or_default();
-        for (stat_type, expected_count) in [
-            ("goal", expected_counts.0),
-            ("assist", expected_counts.1),
-            ("save", expected_counts.2),
-            ("shot", expected_counts.3),
-        ] {
-            while stat_count_for_player(rows, &name, stat_type) > expected_count {
-                if !demote_one_official_credit(rows, &name, stat_type) {
-                    break;
-                }
-            }
-        }
-    }
-}
-
-fn demote_excess_header_stats(
-    rows: &mut [PbpEventRecord],
-    player: &PlayerInfo,
-    expected: (i32, i32, i32, i32),
-) {
-    for (stat_type, expected_count) in [
-        ("goal", expected.0),
-        ("assist", expected.1),
-        ("save", expected.2),
-        ("shot", expected.3),
-    ] {
-        while stat_count_for_player(rows, &player.name, stat_type) > expected_count {
-            if !demote_one_official_credit(rows, &player.name, stat_type) {
-                break;
-            }
-        }
-    }
-}
-
-fn stat_count_for_player(rows: &[PbpEventRecord], player_name: &str, stat_type: &str) -> i32 {
-    let counts = pbp_stat_counts(rows, player_name);
-    match stat_type {
-        "goal" => counts.0,
-        "assist" => counts.1,
-        "save" => counts.2,
-        "shot" => counts.3,
-        _ => 0,
-    }
-}
-
-fn demote_one_official_credit(
-    rows: &mut [PbpEventRecord],
-    player_name: &str,
-    stat_type: &str,
-) -> bool {
-    let flag_key = format!("official_{stat_type}");
-    let count_key = format!("official_{stat_type}_count");
-    let candidate_idx = rows
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, row)| {
-            truthy(row.values.get(&flag_key))
-                && if stat_type == "assist" {
-                    row_string(&row.values, "event_player_2_name") == player_name
-                } else {
-                    row_string(&row.values, "event_player_1_name") == player_name
-                }
-        })
-        .map(|(idx, _)| idx);
-    let Some(idx) = candidate_idx else {
-        return false;
-    };
-    let count = row_i32(&rows[idx].values, &count_key).unwrap_or(1);
-    if count > 1 {
-        rows[idx].values.insert(count_key, (count - 1).to_string());
-        return true;
-    }
-    rows[idx].values.insert(flag_key, "false".to_string());
-    rows[idx].values.insert(count_key, "0".to_string());
-    if stat_type == "assist" {
-        for field in ["id", "name", "team"] {
-            rows[idx]
-                .values
-                .insert(format!("event_player_2_{field}"), String::new());
-        }
-    } else if rows[idx].event_type == stat_type
-        || (stat_type == "shot" && rows[idx].event_type == "shot")
-    {
-        rows[idx].event_type = "touch".to_string();
-        rows[idx]
-            .values
-            .insert("event_type".to_string(), "touch".to_string());
-    }
-    true
-}
-
-fn header_stat_counts(replay: &Replay) -> HashMap<String, (i32, i32, i32, i32)> {
-    let mut expected = HashMap::new();
-    if let Some(players) = header_array(replay, "PlayerStats") {
-        for player in players {
-            let name = prop_string(player, "Name")
-                .or_else(|| prop_string(player, "PlayerName"))
-                .unwrap_or_default();
-            if name.is_empty() {
-                continue;
-            }
-            expected.insert(
-                name,
-                (
-                    prop_i32(player, "Goals").unwrap_or(0),
-                    prop_i32(player, "Assists").unwrap_or(0),
-                    prop_i32(player, "Saves").unwrap_or(0),
-                    prop_i32(player, "Shots").unwrap_or(0),
-                ),
-            );
-        }
-    }
-    expected
-}
-
-fn pbp_stat_counts(rows: &[PbpEventRecord], player_name: &str) -> (i32, i32, i32, i32) {
-    let mut counts = (0, 0, 0, 0);
-    for row in rows {
-        if row_string(&row.values, "event_player_1_name") == player_name {
-            if truthy(row.values.get("official_goal")) {
-                counts.0 += row_i32(&row.values, "official_goal_count").unwrap_or(1);
-            }
-            if truthy(row.values.get("official_save")) {
-                counts.2 += row_i32(&row.values, "official_save_count").unwrap_or(1);
-            }
-            if truthy(row.values.get("official_shot")) {
-                counts.3 += row_i32(&row.values, "official_shot_count").unwrap_or(1);
-            }
-        }
-        if row_string(&row.values, "event_player_2_name") == player_name
-            && truthy(row.values.get("official_assist"))
-        {
-            counts.1 += row_i32(&row.values, "official_assist_count").unwrap_or(1);
-        }
-    }
-    counts
-}
-
-fn reconcile_player_goals(
-    rows: &mut Vec<PbpEventRecord>,
-    player: &PlayerInfo,
-    expected: i32,
-    replay: &Replay,
-    players: &[PlayerInfo],
-    player_static_values: &[(String, String)],
-    game_id: &str,
-    match_guid: &str,
-    replay_name: &str,
-    map_id: &str,
-    context: &PbpContext,
-    team_size: Option<i32>,
-    game_time: &str,
-) {
-    while pbp_stat_counts(rows, &player.name).0 < expected {
-        let goal_frame = header_array(replay, "Goals")
-            .and_then(|goals| {
-                goals.iter().find_map(|goal| {
-                    let name = prop_string(goal, "PlayerName").unwrap_or_default();
-                    if name != player.name {
-                        return None;
-                    }
-                    prop_i32(goal, "frame")
-                        .or_else(|| prop_i32(goal, "Frame"))
-                        .or_else(|| prop_i32(goal, "Time"))
-                })
-            })
-            .unwrap_or(0);
-        rows.push(build_official_stat_row(
-            &OfficialStatEvent {
-                frame_number: goal_frame,
-                player_name: player.name.clone(),
-                stat_type: "goal",
-                stat_number: pbp_stat_counts(rows, &player.name).0 + 1,
-            },
-            players,
-            player_static_values,
-            game_id,
-            match_guid,
-            replay_name,
-            map_id,
-            context,
-            team_size,
-            game_time,
-        ));
-    }
-}
-
-fn reconcile_player_assists(
-    rows: &mut [PbpEventRecord],
-    player: &PlayerInfo,
-    expected: i32,
-    players: &[PlayerInfo],
-) {
-    while pbp_stat_counts(rows, &player.name).1 < expected {
-        let target_idx = rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| row.event_type == "goal")
-            .filter(|(_, row)| row_event_team(row, players) == team_name(player.team))
-            .find(|(_, row)| !truthy(row.values.get("official_assist")))
-            .map(|(idx, _)| idx);
-        if let Some(idx) = target_idx {
-            rows[idx]
-                .values
-                .insert("official_assist".to_string(), "true".to_string());
-            rows[idx]
-                .values
-                .insert("official_assist_count".to_string(), "1".to_string());
-            add_event_player(&mut rows[idx].values, players, 2, &player.name);
-            continue;
-        }
-        let repeat_idx = rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| row.event_type == "goal")
-            .filter(|(_, row)| row_event_team(row, players) == team_name(player.team))
-            .find(|(_, row)| {
-                truthy(row.values.get("official_assist"))
-                    && row_string(&row.values, "event_player_2_name") == player.name
-            })
-            .map(|(idx, _)| idx);
-        if let Some(idx) = repeat_idx {
-            increment_official_count(&mut rows[idx].values, "assist");
-            continue;
-        }
-        let touch_idx = rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| row_event_team(row, players) == team_name(player.team))
-            .filter(|(_, row)| is_ball_touch_row(row))
-            .filter(|(_, row)| !matches!(row.event_type.as_str(), "shot" | "goal" | "save"))
-            .filter(|(_, row)| !truthy(row.values.get("official_assist")))
-            .find(|(_, row)| row_string(&row.values, "event_player_1_name") == player.name)
-            .map(|(idx, _)| idx)
-            .or_else(|| {
-                rows.iter()
-                    .enumerate()
-                    .filter(|(_, row)| row_event_team(row, players) == team_name(player.team))
-                    .filter(|(_, row)| is_ball_touch_row(row))
-                    .filter(|(_, row)| !matches!(row.event_type.as_str(), "shot" | "goal" | "save"))
-                    .filter(|(_, row)| !truthy(row.values.get("official_assist")))
-                    .map(|(idx, _)| idx)
-                    .next()
-            });
-        let Some(idx) = touch_idx else { break };
-        rows[idx]
-            .values
-            .insert("official_assist".to_string(), "true".to_string());
-        rows[idx]
-            .values
-            .insert("official_assist_count".to_string(), "1".to_string());
-        add_event_player(&mut rows[idx].values, players, 2, &player.name);
-    }
-}
-
-fn reconcile_player_saves(
-    rows: &mut Vec<PbpEventRecord>,
-    player: &PlayerInfo,
-    expected: i32,
-    players: &[PlayerInfo],
-    player_static_values: &[(String, String)],
-    game_id: &str,
-    match_guid: &str,
-    replay_name: &str,
-    map_id: &str,
-    context: &PbpContext,
-    team_size: Option<i32>,
-    game_time: &str,
-) {
-    while pbp_stat_counts(rows, &player.name).2 < expected {
-        let frame = official_touch_candidate_frame(rows, &player.name, "official_save")
-            .unwrap_or_else(|| player_first_frame(context, players, &player.name).unwrap_or(0));
-        if let Some(idx) = rows.iter().position(|row| {
-            row.event_type == "save"
-                && row.frame_number == Some(frame)
-                && row_string(&row.values, "event_player_1_name") == player.name
-                && truthy(row.values.get("official_save"))
-        }) {
-            increment_official_count(&mut rows[idx].values, "save");
-            continue;
-        }
-        rows.push(build_official_stat_row(
-            &OfficialStatEvent {
-                frame_number: frame,
-                player_name: player.name.clone(),
-                stat_type: "save",
-                stat_number: pbp_stat_counts(rows, &player.name).2 + 1,
-            },
-            players,
-            player_static_values,
-            game_id,
-            match_guid,
-            replay_name,
-            map_id,
-            context,
-            team_size,
-            game_time,
-        ));
-    }
-}
-
 fn collapse_duplicate_official_saves(rows: &mut Vec<PbpEventRecord>) {
-    let mut indexes: HashMap<(Option<i32>, String, String, String, String), usize> =
-        HashMap::new();
+    let mut indexes: HashMap<(Option<i32>, String, String, String, String), usize> = HashMap::new();
     let mut collapsed: Vec<PbpEventRecord> = Vec::with_capacity(rows.len());
 
     for row in rows.drain(..) {
@@ -5432,9 +6151,10 @@ fn collapse_duplicate_official_saves(rows: &mut Vec<PbpEventRecord>) {
         if let Some(&idx) = indexes.get(&key) {
             let count = row_i32(&row.values, "official_save_count").unwrap_or(1);
             let prior = row_i32(&collapsed[idx].values, "official_save_count").unwrap_or(1);
-            collapsed[idx]
-                .values
-                .insert("official_save_count".to_string(), (prior + count).to_string());
+            collapsed[idx].values.insert(
+                "official_save_count".to_string(),
+                (prior + count).to_string(),
+            );
             continue;
         }
         indexes.insert(key, collapsed.len());
@@ -5444,104 +6164,20 @@ fn collapse_duplicate_official_saves(rows: &mut Vec<PbpEventRecord>) {
     *rows = collapsed;
 }
 
-fn reconcile_player_shots(
-    rows: &mut Vec<PbpEventRecord>,
-    player: &PlayerInfo,
-    expected: i32,
-    players: &[PlayerInfo],
-    player_static_values: &[(String, String)],
+fn audit_pbp_stats(
     game_id: &str,
-    match_guid: &str,
-    replay_name: &str,
-    map_id: &str,
-    context: &PbpContext,
-    team_size: Option<i32>,
-    game_time: &str,
-) {
-    while pbp_stat_counts(rows, &player.name).3 < expected {
-        let candidate_idx = rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| row_string(&row.values, "event_player_1_name") == player.name)
-            .filter(|(_, row)| is_ball_touch_row(row))
-            .filter(|(_, row)| !truthy(row.values.get("official_shot")))
-            .map(|(idx, row)| {
-                (
-                    idx,
-                    row.event_type != "goal",
-                    row.frame_number.unwrap_or(i32::MAX),
-                )
-            })
-            .min_by_key(|(_, non_goal, frame)| (*non_goal, *frame))
-            .map(|(idx, _, _)| idx);
-        if let Some(idx) = candidate_idx {
-            rows[idx]
-                .values
-                .insert("official_shot".to_string(), "true".to_string());
-            rows[idx]
-                .values
-                .insert("official_shot_count".to_string(), "1".to_string());
-            if rows[idx].event_type != "goal" {
-                rows[idx].event_type = "shot".to_string();
-                rows[idx]
-                    .values
-                    .insert("event_type".to_string(), "shot".to_string());
-            }
-            if let Some(frame) = rows[idx].frame_number {
-                set_recorded_frame(&mut rows[idx], frame, true);
-            }
-        } else {
-            let frame = player_first_frame(context, players, &player.name).unwrap_or(0);
-            rows.push(build_official_stat_row(
-                &OfficialStatEvent {
-                    frame_number: frame,
-                    player_name: player.name.clone(),
-                    stat_type: "shot",
-                    stat_number: pbp_stat_counts(rows, &player.name).3 + 1,
-                },
-                players,
-                player_static_values,
-                game_id,
-                match_guid,
-                replay_name,
-                map_id,
-                context,
-                team_size,
-                game_time,
-            ));
-        }
-    }
-}
-
-fn official_touch_candidate_frame(
+    replay: &Replay,
     rows: &[PbpEventRecord],
-    player_name: &str,
-    official_flag: &str,
-) -> Option<i32> {
-    rows.iter()
-        .filter(|row| row_string(&row.values, "event_player_1_name") == player_name)
-        .filter(|row| is_ball_touch_row(row))
-        .filter(|row| !truthy(row.values.get(official_flag)))
-        .filter_map(|row| row.frame_number)
-        .min()
-}
-
-fn player_first_frame(
     context: &PbpContext,
-    players: &[PlayerInfo],
-    player_name: &str,
-) -> Option<i32> {
-    let idx = players
+) -> Result<()> {
+    if context
+        .official_stats
         .iter()
-        .position(|player| player.name == player_name)?;
-    context
-        .frame_states
-        .iter()
-        .find(|snapshot| snapshot.players.get(idx).and_then(Option::as_ref).is_some())
-        .map(|snapshot| snapshot.frame_number)
-}
+        .any(|stat| stat.stat_type == "goal")
+    {
+        return Ok(());
+    }
 
-fn audit_pbp_stats(game_id: &str, replay: &Replay, rows: &[PbpEventRecord]) -> Result<()> {
     let mut actual: HashMap<String, (i32, i32, i32, i32)> = HashMap::new();
     for row in rows {
         let player_1 = row_string(&row.values, "event_player_1_name");
@@ -5574,25 +6210,16 @@ fn audit_pbp_stats(game_id: &str, replay: &Replay, rows: &[PbpEventRecord]) -> R
             if name.is_empty() {
                 continue;
             }
-            let (goals, assists, saves, shots) = actual.get(&name).copied().unwrap_or_default();
-            for (stat_name, expected, observed) in [
-                ("goals", prop_i32(player, "Goals"), goals),
-                ("assists", prop_i32(player, "Assists"), assists),
-                ("saves", prop_i32(player, "Saves"), saves),
-                ("shots", prop_i32(player, "Shots"), shots),
-            ] {
-                if let Some(expected) = expected {
-                    if expected != observed {
-                        mismatches.push(format!(
-                            "{name} {stat_name} header={expected} pbp={observed}"
-                        ));
-                    }
+            let (goals, _, _, _) = actual.get(&name).copied().unwrap_or_default();
+            if let Some(expected) = prop_i32(player, "Goals") {
+                if expected != goals {
+                    mismatches.push(format!("{name} goals header={expected} pbp={goals}"));
                 }
             }
         }
     }
     if !mismatches.is_empty() {
-        //Usually this is one late shot/save credit that never found a clean touch row.
+        //Only header-sourced goals are audited here; PRI stat events are authoritative when recorded.
         eprintln!("PBP stat mismatch {game_id}: {}", mismatches.join("; "));
     }
     Ok(())
@@ -5664,6 +6291,73 @@ fn vec_distance(left: Vec3, right: Vec3) -> f32 {
     ((right.x - left.x).powi(2) + (right.y - left.y).powi(2) + (right.z - left.z).powi(2)).sqrt()
 }
 
+fn vec_dot(left: Vec3, right: Vec3) -> f32 {
+    left.x * right.x + left.y * right.y + left.z * right.z
+}
+
+fn speed_toward_point(velocity: Vec3, from: Vec3, to: Vec3) -> Option<f32> {
+    let direction = Vec3 {
+        x: to.x - from.x,
+        y: to.y - from.y,
+        z: to.z - from.z,
+    };
+    let distance = vec_norm(direction);
+    if distance <= f32::EPSILON {
+        return None;
+    }
+    Some(vec_dot(velocity, direction) / distance)
+}
+
+fn point_to_segment_distance_2d(point: Vec3, start: Vec3, end: Vec3) -> f32 {
+    let segment_x = end.x - start.x;
+    let segment_y = end.y - start.y;
+    let length_squared = segment_x * segment_x + segment_y * segment_y;
+    if length_squared <= f32::EPSILON {
+        return ((point.x - start.x).powi(2) + (point.y - start.y).powi(2)).sqrt();
+    }
+    let t = (((point.x - start.x) * segment_x + (point.y - start.y) * segment_y) / length_squared)
+        .clamp(0.0, 1.0);
+    let closest_x = start.x + t * segment_x;
+    let closest_y = start.y + t * segment_y;
+    ((point.x - closest_x).powi(2) + (point.y - closest_y).powi(2)).sqrt()
+}
+
+fn whiff_like_miss(
+    previous_player_pos: Vec3,
+    player_pos: Vec3,
+    previous_ball_pos: Vec3,
+    ball_pos: Vec3,
+) -> bool {
+    let previous_distance = vec_distance(previous_player_pos, previous_ball_pos);
+    let current_distance = vec_distance(player_pos, ball_pos);
+    if previous_distance > WHIFF_PREVIOUS_BALL_DISTANCE && current_distance > WHIFF_BALL_DISTANCE {
+        return false;
+    }
+    let separating_after_approach = current_distance >= previous_distance + 25.0;
+
+    let previous_relative = Vec3 {
+        x: previous_player_pos.x - previous_ball_pos.x,
+        y: previous_player_pos.y - previous_ball_pos.y,
+        z: previous_player_pos.z - previous_ball_pos.z,
+    };
+    let current_relative = Vec3 {
+        x: player_pos.x - ball_pos.x,
+        y: player_pos.y - ball_pos.y,
+        z: player_pos.z - ball_pos.z,
+    };
+    let relative_crossed = vec_dot(previous_relative, current_relative) < 0.0
+        && current_distance <= WHIFF_BALL_DISTANCE;
+    let player_path_missed_ball =
+        point_to_segment_distance_2d(ball_pos, previous_player_pos, player_pos)
+            <= WHIFF_CROSS_BALL_DISTANCE;
+    let ball_path_missed_player =
+        point_to_segment_distance_2d(player_pos, previous_ball_pos, ball_pos)
+            <= WHIFF_CROSS_BALL_DISTANCE;
+
+    separating_after_approach
+        && (relative_crossed || player_path_missed_ball || ball_path_missed_player)
+}
+
 fn is_shot(event: &BallEvent, players: &[PlayerInfo]) -> bool {
     let team = player_team(&event.player_name, players).unwrap_or(0);
     let toward_orange_goal = team == 0 && event.ball_state.vel.y > 0.0;
@@ -5682,6 +6376,83 @@ fn is_shot(event: &BallEvent, players: &[PlayerInfo]) -> bool {
     let x_at_goal = event.ball_state.pos.x + event.ball_state.vel.x * t;
     let z_at_goal = event.ball_state.pos.z + event.ball_state.vel.z * t - 0.5 * GRAVITY * t * t;
     x_at_goal.abs() <= GOAL_CENTER_TO_POST && z_at_goal > 0.0 && z_at_goal <= GOAL_HEIGHT
+}
+
+fn is_missed_shot(event: &BallEvent, players: &[PlayerInfo]) -> bool {
+    let team = player_team(&event.player_name, players).unwrap_or(0);
+    let toward_orange_goal = team == 0 && event.ball_state.vel.y > 0.0;
+    let toward_blue_goal = team == 1 && event.ball_state.vel.y < 0.0;
+    if !(toward_orange_goal || toward_blue_goal) || event.ball_state.vel.y.abs() < 1.0 {
+        return false;
+    }
+    let goal_y = if team == 0 { BACK_WALL_Y } else { -BACK_WALL_Y };
+    let t = (goal_y - event.ball_state.pos.y) / event.ball_state.vel.y;
+    if !(0.0..=3.0).contains(&t) {
+        return false;
+    }
+    let x_at_goal = event.ball_state.pos.x + event.ball_state.vel.x * t;
+    let z_at_goal = event.ball_state.pos.z + event.ball_state.vel.z * t - 0.5 * GRAVITY * t * t;
+    z_at_goal > 0.0
+        && z_at_goal <= MISSED_SHOT_MAX_HEIGHT
+        && x_at_goal.abs() <= GOAL_CENTER_TO_POST + MISSED_SHOT_MAX_LATERAL_MISS
+        && (x_at_goal.abs() > GOAL_CENTER_TO_POST || z_at_goal > GOAL_HEIGHT)
+}
+
+fn missed_pass_target(event: &BallEvent, players: &[PlayerInfo]) -> Option<String> {
+    let passer_team = player_team(&event.player_name, players)?;
+    let ball_speed = vec_norm(event.ball_state.vel);
+    if ball_speed < MISSED_PASS_MIN_SPEED {
+        return None;
+    }
+
+    let mut best_target: Option<(String, f32, f32)> = None;
+    for (player_idx, player) in players.iter().enumerate() {
+        if player.team != passer_team || player.name == event.player_name {
+            continue;
+        }
+        let Some(target_pos) = event.player_positions.get(player_idx).copied().flatten() else {
+            continue;
+        };
+        let to_target = Vec3 {
+            x: target_pos.x - event.ball_state.pos.x,
+            y: target_pos.y - event.ball_state.pos.y,
+            z: target_pos.z - event.ball_state.pos.z,
+        };
+        let target_distance = vec_norm(to_target);
+        if target_distance <= f32::EPSILON {
+            continue;
+        }
+        let forward_dot = vec_dot(event.ball_state.vel, to_target) / (ball_speed * target_distance);
+        if forward_dot < MISSED_PASS_MIN_FORWARD_DOT {
+            continue;
+        }
+        let miss_distance = projected_ball_target_distance(event, target_pos);
+        if miss_distance <= MISSED_PASS_TARGET_RADIUS || miss_distance > MISSED_PASS_MAX_TARGET_MISS
+        {
+            continue;
+        }
+        match &best_target {
+            Some((_, best_miss, _)) if miss_distance >= *best_miss => {}
+            _ => best_target = Some((player.name.clone(), miss_distance, target_distance)),
+        }
+    }
+
+    best_target.map(|(name, _, _)| name)
+}
+
+fn projected_ball_target_distance(event: &BallEvent, target_pos: Vec3) -> f32 {
+    let mut best = f32::MAX;
+    for sample in 1..=12 {
+        let t = MISSED_PASS_PROJECTION_SECONDS * sample as f32 / 12.0;
+        let predicted = Vec3 {
+            x: event.ball_state.pos.x + event.ball_state.vel.x * t,
+            y: event.ball_state.pos.y + event.ball_state.vel.y * t,
+            z: (event.ball_state.pos.z + event.ball_state.vel.z * t - 0.5 * GRAVITY * t * t)
+                .max(BALL_RADIUS),
+        };
+        best = best.min(vec_distance(predicted, target_pos));
+    }
+    best
 }
 
 fn is_clear(event: &BallEvent, next_event: Option<&BallEvent>, players: &[PlayerInfo]) -> bool {
@@ -5761,13 +6532,40 @@ fn infer_team_number(
 }
 
 fn loadout_body_id(value: &Value, team: i32) -> Option<i32> {
+    loadout_item_id(value, team, "body")
+}
+
+fn loadout_item_id(value: &Value, team: i32, item: &str) -> Option<i32> {
     let side = if team == 1 { "orange" } else { "blue" };
     value
         .get("TeamLoadout")?
         .get(side)?
-        .get("body")?
+        .get(item)?
         .as_i64()
         .and_then(|value| i32::try_from(value).ok())
+}
+
+fn assign_player_loadout(player: &mut PlayerInfo, value: &Value) {
+    if let Some(car_id) = loadout_body_id(value, player.team) {
+        player.car_id = car_id.to_string();
+        player.car_name = car_name(car_id).to_string();
+    }
+    for (field, item) in [
+        (&mut player.decal_id, "decal"),
+        (&mut player.wheels_id, "wheels"),
+        (&mut player.boost_id, "boost"),
+        (&mut player.antenna_id, "antenna"),
+        (&mut player.topper_id, "topper"),
+        (&mut player.engine_audio_id, "engine_audio"),
+        (&mut player.trail_id, "trail"),
+        (&mut player.goal_explosion_id, "goal_explosion"),
+        (&mut player.primary_paint_finish_id, "paint_finish"),
+        (&mut player.accent_paint_finish_id, "accent_paint_finish"),
+    ] {
+        if let Some(value) = loadout_item_id(value, player.team, item) {
+            *field = value.to_string();
+        }
+    }
 }
 
 fn playlist_name(value: i32) -> &'static str {
@@ -5794,7 +6592,7 @@ fn car_name(car_id: i32) -> &'static str {
 }
 
 fn pbp_player_static_values(players: &[PlayerInfo]) -> Vec<(String, String)> {
-    let mut values = Vec::with_capacity(players.len() * 12);
+    let mut values = Vec::with_capacity(players.len() * 28);
     for player in players {
         values.push((format!("{}_id", player.slot), player.id.clone()));
         values.push((format!("{}_actor_id", player.slot), player.actor_id.clone()));
@@ -5805,17 +6603,77 @@ fn pbp_player_static_values(players: &[PlayerInfo]) -> Vec<(String, String)> {
         values.push((format!("{}_name", player.slot), player.name.clone()));
         values.push((format!("{}_platform", player.slot), player.platform.clone()));
         values.push((format!("{}_is_bot", player.slot), player.is_bot.clone()));
-        values.push((format!("{}_title_id", player.slot), player.title_id.clone()));
-        values.push((
-            format!("{}_first_frame_in_game", player.slot),
-            player.first_frame_in_game.clone(),
-        ));
+        values.push((format!("{}_score", player.slot), player.score.clone()));
         values.push((
             format!("{}_time_in_game", player.slot),
             player.time_in_game.clone(),
         ));
         values.push((format!("{}_car_id", player.slot), player.car_id.clone()));
         values.push((format!("{}_car_name", player.slot), player.car_name.clone()));
+        values.push((format!("{}_decal_id", player.slot), player.decal_id.clone()));
+        values.push((
+            format!("{}_wheels_id", player.slot),
+            player.wheels_id.clone(),
+        ));
+        values.push((format!("{}_boost_id", player.slot), player.boost_id.clone()));
+        values.push((
+            format!("{}_antenna_id", player.slot),
+            player.antenna_id.clone(),
+        ));
+        values.push((
+            format!("{}_topper_id", player.slot),
+            player.topper_id.clone(),
+        ));
+        values.push((
+            format!("{}_engine_audio_id", player.slot),
+            player.engine_audio_id.clone(),
+        ));
+        values.push((format!("{}_trail_id", player.slot), player.trail_id.clone()));
+        values.push((
+            format!("{}_goal_explosion_id", player.slot),
+            player.goal_explosion_id.clone(),
+        ));
+        values.push((
+            format!("{}_primary_paint_finish_id", player.slot),
+            player.primary_paint_finish_id.clone(),
+        ));
+        values.push((
+            format!("{}_accent_paint_finish_id", player.slot),
+            player.accent_paint_finish_id.clone(),
+        ));
+        if let Some(camera) = player.camera_settings {
+            values.push((
+                format!("{}_camera_fov", player.slot),
+                camera.fov.to_string(),
+            ));
+            values.push((
+                format!("{}_camera_height", player.slot),
+                camera.height.to_string(),
+            ));
+            values.push((
+                format!("{}_camera_angle", player.slot),
+                camera.angle.to_string(),
+            ));
+            values.push((
+                format!("{}_camera_distance", player.slot),
+                camera.distance.to_string(),
+            ));
+            values.push((
+                format!("{}_camera_stiffness", player.slot),
+                camera.stiffness.to_string(),
+            ));
+            values.push((
+                format!("{}_camera_swivel", player.slot),
+                camera.swivel.to_string(),
+            ));
+            values.push((
+                format!("{}_camera_transition", player.slot),
+                camera
+                    .transition
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            ));
+        }
     }
     values
 }
@@ -5860,14 +6718,11 @@ fn pbp_base_values(
     _game_time: &str,
 ) -> RowValues {
     let mut values = RowValues::new();
-    values.insert("game_id".to_string(), game_id.to_string());
-    values.insert("blue_team_name".to_string(), context.blue_team_name.clone());
-    values.insert(
-        "orange_team_name".to_string(),
-        context.orange_team_name.clone(),
-    );
+    values.insert_utf8("game_id", game_id.to_string());
+    values.insert_utf8("blue_team_name", context.blue_team_name.clone());
+    values.insert_utf8("orange_team_name", context.orange_team_name.clone());
     if let Some(size) = team_size {
-        values.insert("team_size".to_string(), size.to_string());
+        values.insert_i32("team_size", size);
     }
     values
 }
@@ -5917,9 +6772,9 @@ fn game_seconds_elapsed(context: &PbpContext, frame_number: i32) -> f32 {
 }
 
 fn insert_seconds_elapsed(values: &mut RowValues, context: &PbpContext, frame_number: i32) {
-    values.insert(
-        "seconds_elapsed".to_string(),
-        game_seconds_elapsed(context, frame_number).to_string(),
+    values.insert_f32(
+        "seconds_elapsed",
+        game_seconds_elapsed(context, frame_number),
     );
 }
 
@@ -5950,10 +6805,7 @@ fn add_frame_state_values(
                 &format!("{slot}_boost"),
                 state.boost.map(i32::from).map(boost_units),
             );
-            values.insert(
-                format!("{slot}_boost_active"),
-                state.boost_active.to_string(),
-            );
+            values.insert_bool(&format!("{slot}_boost_active"), state.boost_active);
             insert_opt(
                 values,
                 &format!("{slot}_boost_collect"),
@@ -5961,19 +6813,16 @@ fn add_frame_state_values(
             );
             insert_opt(values, &format!("{slot}_throttle"), state.throttle);
             insert_opt(values, &format!("{slot}_steer"), state.steer);
-            values.insert(format!("{slot}_handbrake"), state.handbrake.to_string());
-            values.insert(format!("{slot}_ball_cam"), state.ball_cam.to_string());
-            values.insert(
-                format!("{slot}_dodge_active"),
-                state.dodge_active.to_string(),
+            values.insert_bool(&format!("{slot}_handbrake"), state.handbrake);
+            values.insert_bool(&format!("{slot}_ball_cam"), state.ball_cam);
+            values.insert_bool(&format!("{slot}_dodge_active"), state.dodge_active);
+            values.insert_bool(&format!("{slot}_jump_active"), state.jump_active);
+            values.insert_bool(
+                &format!("{slot}_double_jump_active"),
+                state.double_jump_active,
             );
-            values.insert(format!("{slot}_jump_active"), state.jump_active.to_string());
-            values.insert(
-                format!("{slot}_double_jump_active"),
-                state.double_jump_active.to_string(),
-            );
-            values.insert(format!("{slot}_jumped"), state.jumped.to_string());
-            values.insert(format!("{slot}_flipped"), state.flipped.to_string());
+            values.insert_bool(&format!("{slot}_jumped"), state.jumped);
+            values.insert_bool(&format!("{slot}_flipped"), state.flipped);
             insert_opt(
                 values,
                 &format!("{slot}_jump_air_activate_count"),
@@ -5994,44 +6843,38 @@ fn add_frame_state_values(
                 &format!("{slot}_dodges_refreshed_counter"),
                 state.dodges_refreshed_counter,
             );
-            values.insert(format!("{slot}_supersonic"), state.supersonic.to_string());
-            values.insert(
-                format!("{slot}_flip_available"),
-                state.flip_available.to_string(),
-            );
+            values.insert_bool(&format!("{slot}_supersonic"), state.supersonic);
+            values.insert_bool(&format!("{slot}_flip_available"), state.flip_available);
         }
     }
+    add_spatial_features_from_snapshot(values, snapshot, players);
 }
 
-fn add_entity_state_values(values: &mut RowValues, prefix: &str, state: EntityState) {
-    if !state.has_pos {
-        return;
-    }
-    values.insert(format!("{prefix}_pos_x"), state.pos.x.to_string());
-    values.insert(format!("{prefix}_pos_y"), state.pos.y.to_string());
-    values.insert(format!("{prefix}_pos_z"), state.pos.z.to_string());
-    values.insert(format!("{prefix}_vel_x"), state.vel.x.to_string());
-    values.insert(format!("{prefix}_vel_y"), state.vel.y.to_string());
-    values.insert(format!("{prefix}_vel_z"), state.vel.z.to_string());
-    values.insert(format!("{prefix}_ang_vel_x"), state.ang_vel.x.to_string());
-    values.insert(format!("{prefix}_ang_vel_y"), state.ang_vel.y.to_string());
-    values.insert(format!("{prefix}_ang_vel_z"), state.ang_vel.z.to_string());
-    values.insert(format!("{prefix}_rot_x"), state.rot.x.to_string());
-    values.insert(format!("{prefix}_rot_y"), state.rot.y.to_string());
-    values.insert(format!("{prefix}_rot_z"), state.rot.z.to_string());
-}
+fn add_spatial_features_from_snapshot(
+    values: &mut RowValues,
+    snapshot: &FrameSnapshot,
+    players: &[PlayerInfo],
+) {
+    let ball = snapshot
+        .ball
+        .filter(|state| state.has_pos)
+        .map(|state| state.pos);
+    let player_positions = players
+        .iter()
+        .enumerate()
+        .map(|(idx, _)| {
+            snapshot
+                .players
+                .get(idx)
+                .and_then(Option::as_ref)
+                .filter(|state| state.entity.has_pos)
+                .map(|state| state.entity.pos)
+        })
+        .collect::<Vec<_>>();
 
-fn insert_opt(values: &mut RowValues, key: &str, value: Option<i32>) {
-    if let Some(value) = value {
-        values.insert(key.to_string(), value.to_string());
-    }
-}
-
-fn add_spatial_features(values: &mut RowValues, players: &[PlayerInfo]) {
-    let ball = row_vec(values, "ball", "pos");
-    for player in players {
+    for (player_idx, player) in players.iter().enumerate() {
         let slot = &player.slot;
-        let pos = row_vec(values, slot, "pos");
+        let pos = player_positions.get(player_idx).copied().flatten();
         let own_net = defensive_net(player.team);
         let opp_net = offensive_net(player.team);
         set_float(
@@ -6064,20 +6907,63 @@ fn add_spatial_features(values: &mut RowValues, players: &[PlayerInfo]) {
             &format!("{slot}_angle_to_opp_net"),
             angle_opt(pos, opp_net),
         );
+        if let (Some(pos), Some(ball)) = (pos, ball) {
+            let player_ball_distance = vec_distance(pos, ball);
+            let closer_teammates = players
+                .iter()
+                .enumerate()
+                .filter(|(teammate_idx, teammate)| {
+                    *teammate_idx != player_idx && teammate.team == player.team
+                })
+                .filter_map(|(teammate_idx, _)| {
+                    player_positions.get(teammate_idx).copied().flatten()
+                })
+                .filter(|teammate_pos| vec_distance(*teammate_pos, ball) < player_ball_distance)
+                .count();
+            values.insert_i32(
+                &format!("{slot}_rotation_role"),
+                (closer_teammates + 1) as i32,
+            );
+        }
     }
-    for source in players {
-        let source_pos = row_vec(values, &source.slot, "pos");
-        for target in players {
-            if source.slot == target.slot {
+
+    for (source_idx, source) in players.iter().enumerate() {
+        let source_pos = player_positions.get(source_idx).copied().flatten();
+        for (target_idx, target) in players.iter().enumerate() {
+            if source_idx == target_idx {
                 continue;
             }
-            let target_pos = row_vec(values, &target.slot, "pos");
+            let target_pos = player_positions.get(target_idx).copied().flatten();
             set_float(
                 values,
                 &format!("{}_distance_to_{}", source.slot, target.slot),
                 distance_opt(source_pos, target_pos),
             );
         }
+    }
+}
+
+fn add_entity_state_values(values: &mut RowValues, prefix: &str, state: EntityState) {
+    if !state.has_pos {
+        return;
+    }
+    values.insert_f32(&format!("{prefix}_pos_x"), state.pos.x);
+    values.insert_f32(&format!("{prefix}_pos_y"), state.pos.y);
+    values.insert_f32(&format!("{prefix}_pos_z"), state.pos.z);
+    values.insert_f32(&format!("{prefix}_vel_x"), state.vel.x);
+    values.insert_f32(&format!("{prefix}_vel_y"), state.vel.y);
+    values.insert_f32(&format!("{prefix}_vel_z"), state.vel.z);
+    values.insert_f32(&format!("{prefix}_ang_vel_x"), state.ang_vel.x);
+    values.insert_f32(&format!("{prefix}_ang_vel_y"), state.ang_vel.y);
+    values.insert_f32(&format!("{prefix}_ang_vel_z"), state.ang_vel.z);
+    values.insert_f32(&format!("{prefix}_rot_x"), state.rot.x);
+    values.insert_f32(&format!("{prefix}_rot_y"), state.rot.y);
+    values.insert_f32(&format!("{prefix}_rot_z"), state.rot.z);
+}
+
+fn insert_opt(values: &mut RowValues, key: &str, value: Option<i32>) {
+    if let Some(value) = value {
+        values.insert_i32(key, value);
     }
 }
 
@@ -6420,10 +7306,7 @@ fn offensive_third_line(team: i32, third: f32) -> f32 {
 }
 
 fn touch_zone_event_controlled(event: &BallEvent, context: &PbpContext) -> bool {
-    context
-        .frame_states
-        .iter()
-        .find(|snapshot| snapshot.frame_number == event.frame_number)
+    frame_snapshot(context, event.frame_number)
         .and_then(|snapshot| {
             let ball = snapshot.ball?;
             closest_possessor(snapshot, &context.players, ball.pos)
@@ -6607,6 +7490,418 @@ fn carrier_moving_toward_opponent_net(
     }
 }
 
+fn add_whiff_events(
+    rows: &mut Vec<PbpEventRecord>,
+    context: &PbpContext,
+    player_static_values: &[(String, String)],
+    game_id: &str,
+    match_guid: &str,
+    replay_name: &str,
+    map_id: &str,
+    team_size: Option<i32>,
+    game_time: &str,
+) {
+    let mut last_whiff_frame: HashMap<String, i32> = HashMap::new();
+    let (all_touch_frames, player_touch_frames) = touch_frame_indexes(context);
+    let mut touch_events: Vec<(i32, &str)> = context
+        .ball_events
+        .iter()
+        .map(|event| (event.frame_number, event.player_name.as_str()))
+        .collect();
+    touch_events.sort_unstable_by_key(|(frame_number, _)| *frame_number);
+
+    for pair in context.frame_states.windows(2) {
+        let previous_snapshot = &pair[0];
+        let snapshot = &pair[1];
+        let ball = match snapshot.ball {
+            Some(value) if value.has_pos => value,
+            _ => continue,
+        };
+        let previous_ball = match previous_snapshot.ball {
+            Some(value) if value.has_pos => value,
+            _ => continue,
+        };
+
+        for (player_idx, player) in context.players.iter().enumerate() {
+            let Some(player_state) = snapshot.players.get(player_idx).and_then(Option::as_ref)
+            else {
+                continue;
+            };
+            let Some(previous_player_state) = previous_snapshot
+                .players
+                .get(player_idx)
+                .and_then(Option::as_ref)
+            else {
+                continue;
+            };
+            if !player_state.entity.has_pos || !previous_player_state.entity.has_pos {
+                continue;
+            }
+            let recent = last_whiff_frame
+                .get(&player.name)
+                .map(|frame| snapshot.frame_number - *frame <= WHIFF_COOLDOWN_FRAMES)
+                .unwrap_or(false);
+            if recent
+                || whiff_has_near_touch_from_indexes(
+                    &all_touch_frames,
+                    &player_touch_frames,
+                    snapshot.frame_number,
+                    &player.name,
+                )
+                || next_direct_touch_by_player(
+                    &touch_events,
+                    snapshot.frame_number,
+                    player.name.as_str(),
+                )
+                || !next_touch_by_other_player(
+                    &touch_events,
+                    snapshot.frame_number,
+                    player.name.as_str(),
+                )
+            {
+                continue;
+            }
+
+            let player_pos = player_state.entity.pos;
+            let distance_to_ball = vec_distance(player_pos, ball.pos);
+            if distance_to_ball > WHIFF_BALL_DISTANCE {
+                continue;
+            }
+
+            let Some(speed_toward_ball) =
+                speed_toward_point(player_state.entity.vel, player_pos, ball.pos)
+            else {
+                continue;
+            };
+            let attempt_input_active = player_state.boost_active
+                || player_state.dodge_active
+                || player_state.jump_active
+                || player_state.double_jump_active
+                || player_state.flipped;
+            let committed = speed_toward_ball >= WHIFF_COMMITTED_SPEED_TOWARD_BALL
+                || (speed_toward_ball >= WHIFF_MIN_SPEED_TOWARD_BALL && attempt_input_active);
+            if !committed {
+                continue;
+            }
+            if !whiff_like_miss(
+                previous_player_state.entity.pos,
+                player_pos,
+                previous_ball.pos,
+                ball.pos,
+            ) {
+                continue;
+            }
+
+            let mut row = build_zone_event_row(
+                "whiff",
+                snapshot.frame_number,
+                player.team,
+                Some(player.name.as_str()),
+                false,
+                ball.pos,
+                None,
+                game_id,
+                match_guid,
+                replay_name,
+                map_id,
+                context,
+                player_static_values,
+                team_size,
+                game_time,
+            );
+            row.values
+                .insert("distance".to_string(), distance_to_ball.to_string());
+            rows.push(row);
+            last_whiff_frame.insert(player.name.clone(), snapshot.frame_number);
+        }
+    }
+}
+
+fn touch_frame_indexes(context: &PbpContext) -> (Vec<i32>, HashMap<String, Vec<i32>>) {
+    let mut all_touch_frames = Vec::with_capacity(context.ball_events.len());
+    let mut player_touch_frames: HashMap<String, Vec<i32>> = HashMap::new();
+    for event in &context.ball_events {
+        all_touch_frames.push(event.frame_number);
+        player_touch_frames
+            .entry(event.player_name.clone())
+            .or_default()
+            .push(event.frame_number);
+    }
+    all_touch_frames.sort_unstable();
+    for frames in player_touch_frames.values_mut() {
+        frames.sort_unstable();
+    }
+    (all_touch_frames, player_touch_frames)
+}
+
+fn whiff_has_near_touch_from_indexes(
+    all_touch_frames: &[i32],
+    player_touch_frames: &HashMap<String, Vec<i32>>,
+    frame_number: i32,
+    player_name: &str,
+) -> bool {
+    frame_near(
+        all_touch_frames,
+        frame_number,
+        WHIFF_ANY_TOUCH_EXCLUSION_FRAMES,
+    ) || player_touch_frames
+        .get(player_name)
+        .map(|frames| frame_near(frames, frame_number, WHIFF_TOUCH_EXCLUSION_FRAMES))
+        .unwrap_or(false)
+}
+
+fn next_direct_touch_by_player(
+    touch_events: &[(i32, &str)],
+    frame_number: i32,
+    player_name: &str,
+) -> bool {
+    let idx = touch_events.partition_point(|(touch_frame, _)| *touch_frame <= frame_number);
+    touch_events
+        .get(idx)
+        .map(|(touch_frame, touch_player)| {
+            *touch_frame - frame_number <= WHIFF_DIRECT_TOUCH_WINDOW_FRAMES
+                && *touch_player == player_name
+        })
+        .unwrap_or(false)
+}
+
+fn next_touch_by_other_player(
+    touch_events: &[(i32, &str)],
+    frame_number: i32,
+    player_name: &str,
+) -> bool {
+    let idx = touch_events.partition_point(|(touch_frame, _)| *touch_frame <= frame_number);
+    touch_events
+        .get(idx)
+        .map(|(touch_frame, touch_player)| {
+            *touch_frame - frame_number <= WHIFF_NEXT_OTHER_TOUCH_WINDOW_FRAMES
+                && *touch_player != player_name
+        })
+        .unwrap_or(false)
+}
+
+fn frame_near(frames: &[i32], frame_number: i32, window_frames: i32) -> bool {
+    if frames.is_empty() {
+        return false;
+    }
+    let lower = frame_number - window_frames;
+    let upper = frame_number + window_frames;
+    let idx = frames.partition_point(|frame| *frame < lower);
+    while idx < frames.len() && frames[idx] <= upper {
+        return true;
+    }
+    false
+}
+
+fn add_fake_events(
+    rows: &mut Vec<PbpEventRecord>,
+    context: &PbpContext,
+    player_static_values: &[(String, String)],
+    game_id: &str,
+    match_guid: &str,
+    replay_name: &str,
+    map_id: &str,
+    team_size: Option<i32>,
+    game_time: &str,
+) {
+    let mut last_fake_frame: HashMap<(String, String), i32> = HashMap::new();
+    let (all_touch_frames, player_touch_frames) = touch_frame_indexes(context);
+    let mut touch_events: Vec<(i32, &str)> = context
+        .ball_events
+        .iter()
+        .map(|event| (event.frame_number, event.player_name.as_str()))
+        .collect();
+    touch_events.sort_unstable_by_key(|(frame_number, _)| *frame_number);
+    let mut whiff_frames: HashMap<String, Vec<i32>> = HashMap::new();
+    let mut fake_whiff_replacements: Vec<(String, i32)> = Vec::new();
+    for row in rows.iter().filter(|row| row.event_type == "whiff") {
+        let player_name = row_string(&row.values, "event_player_1_name");
+        if let Some(frame_number) = row.frame_number {
+            whiff_frames
+                .entry(player_name)
+                .or_default()
+                .push(frame_number);
+        }
+    }
+    for frames in whiff_frames.values_mut() {
+        frames.sort_unstable();
+    }
+
+    for pair in context.frame_states.windows(2) {
+        let previous_snapshot = &pair[0];
+        let snapshot = &pair[1];
+        let ball = match snapshot.ball {
+            Some(value) if value.has_pos => value,
+            _ => continue,
+        };
+        let previous_ball = match previous_snapshot.ball {
+            Some(value) if value.has_pos => value,
+            _ => continue,
+        };
+        let Some(possessor_idx) = closest_possessor_within(
+            snapshot,
+            &context.players,
+            ball.pos,
+            FAKE_POSSESSION_DISTANCE,
+        ) else {
+            continue;
+        };
+        let Some(possessor) = context.players.get(possessor_idx) else {
+            continue;
+        };
+        let Some(possessor_state) = snapshot.players.get(possessor_idx).and_then(Option::as_ref)
+        else {
+            continue;
+        };
+        let Some(previous_possessor_state) = previous_snapshot
+            .players
+            .get(possessor_idx)
+            .and_then(Option::as_ref)
+        else {
+            continue;
+        };
+
+        let previous_ball_speed = vec_norm(previous_ball.vel);
+        let ball_speed = vec_norm(ball.vel);
+        let ball_speed_drop = previous_ball_speed - ball_speed;
+        let ball_speed_change = vec_distance(previous_ball.vel, ball.vel);
+        let ball_direction_changed = previous_ball_speed > f32::EPSILON
+            && ball_speed > f32::EPSILON
+            && vec_dot(previous_ball.vel, ball.vel) / (previous_ball_speed * ball_speed)
+                <= FAKE_MAX_BALL_DIRECTION_DOT;
+        let possessor_stayed_near_ball = vec_distance(possessor_state.entity.pos, ball.pos)
+            <= FAKE_POSSESSION_DISTANCE
+            && vec_distance(previous_possessor_state.entity.pos, previous_ball.pos)
+                <= FAKE_POSSESSION_DISTANCE;
+        let feint_changed_ball = possessor_stayed_near_ball
+            && (ball_speed_drop >= FAKE_MIN_BALL_SPEED_DROP
+                || ball_speed_change >= FAKE_MIN_BALL_SPEED_CHANGE
+                || ball_direction_changed);
+        if !feint_changed_ball {
+            continue;
+        }
+
+        for (defender_idx, defender) in context.players.iter().enumerate() {
+            if defender.team == possessor.team {
+                continue;
+            }
+            let Some(defender_state) = snapshot.players.get(defender_idx).and_then(Option::as_ref)
+            else {
+                continue;
+            };
+            let Some(previous_defender_state) = previous_snapshot
+                .players
+                .get(defender_idx)
+                .and_then(Option::as_ref)
+            else {
+                continue;
+            };
+            if !defender_state.entity.has_pos || !previous_defender_state.entity.has_pos {
+                continue;
+            }
+
+            let key = (possessor.name.clone(), defender.name.clone());
+            if last_fake_frame
+                .get(&key)
+                .map(|frame| snapshot.frame_number - *frame <= FAKE_COOLDOWN_FRAMES)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if whiff_has_near_touch_from_indexes(
+                &all_touch_frames,
+                &player_touch_frames,
+                snapshot.frame_number,
+                &defender.name,
+            ) || next_direct_touch_by_player(
+                &touch_events,
+                snapshot.frame_number,
+                defender.name.as_str(),
+            ) {
+                continue;
+            }
+
+            let defender_distance = vec_distance(defender_state.entity.pos, ball.pos);
+            if defender_distance > FAKE_DEFENDER_BALL_DISTANCE || defender_distance <= BALL_RADIUS {
+                continue;
+            }
+            if vec_norm(defender_state.entity.vel) < FAKE_DEFENDER_MIN_SPEED {
+                continue;
+            }
+            let Some(defender_speed_toward_ball) = speed_toward_point(
+                defender_state.entity.vel,
+                defender_state.entity.pos,
+                ball.pos,
+            ) else {
+                continue;
+            };
+            if defender_speed_toward_ball < FAKE_DEFENDER_MIN_SPEED_TOWARD_BALL {
+                continue;
+            }
+
+            if !whiff_like_miss(
+                previous_defender_state.entity.pos,
+                defender_state.entity.pos,
+                previous_ball.pos,
+                ball.pos,
+            ) {
+                continue;
+            }
+
+            let mut row = build_zone_event_row(
+                "fake",
+                snapshot.frame_number,
+                possessor.team,
+                Some(possessor.name.as_str()),
+                true,
+                ball.pos,
+                None,
+                game_id,
+                match_guid,
+                replay_name,
+                map_id,
+                context,
+                player_static_values,
+                team_size,
+                game_time,
+            );
+            add_event_player(&mut row.values, &context.players, 2, &defender.name);
+            row.values
+                .insert("distance".to_string(), defender_distance.to_string());
+            row.values.insert(
+                "relative_speed".to_string(),
+                vec_norm(defender_state.entity.vel).to_string(),
+            );
+            rows.push(row);
+            last_fake_frame.insert(key, snapshot.frame_number);
+            if whiff_frames
+                .get(&defender.name)
+                .map(|frames| frame_near(frames, snapshot.frame_number, WHIFF_COOLDOWN_FRAMES))
+                .unwrap_or(false)
+            {
+                fake_whiff_replacements.push((defender.name.clone(), snapshot.frame_number));
+            }
+        }
+    }
+    if !fake_whiff_replacements.is_empty() {
+        rows.retain(|row| {
+            if row.event_type != "whiff" {
+                return true;
+            }
+            let player_name = row_string(&row.values, "event_player_1_name");
+            let Some(frame_number) = row.frame_number else {
+                return true;
+            };
+            !fake_whiff_replacements
+                .iter()
+                .any(|(defender_name, fake_frame)| {
+                    defender_name == &player_name
+                        && (frame_number - *fake_frame).abs() <= WHIFF_COOLDOWN_FRAMES
+                })
+        });
+    }
+}
+
 fn zone_event_exists(
     rows: &[PbpEventRecord],
     event_type: &str,
@@ -6656,6 +7951,15 @@ fn closest_possessor(
     players: &[PlayerInfo],
     ball_pos: Vec3,
 ) -> Option<usize> {
+    closest_possessor_within(snapshot, players, ball_pos, POSSESSION_DISTANCE)
+}
+
+fn closest_possessor_within(
+    snapshot: &FrameSnapshot,
+    players: &[PlayerInfo],
+    ball_pos: Vec3,
+    max_distance: f32,
+) -> Option<usize> {
     players
         .iter()
         .enumerate()
@@ -6665,7 +7969,7 @@ fn closest_possessor(
                 return None;
             }
             let distance = vec_distance(state.entity.pos, ball_pos);
-            (distance <= POSSESSION_DISTANCE).then_some((idx, distance))
+            (distance <= max_distance).then_some((idx, distance))
         })
         .min_by(|left, right| {
             left.1
@@ -6724,7 +8028,6 @@ fn build_zone_event_row(
         zone_line_y.unwrap_or(ball_pos.y).to_string(),
     );
     values.insert("event_ball_pos_z".to_string(), ball_pos.z.to_string());
-    add_spatial_features(&mut values, &context.players);
     PbpEventRecord {
         frame_number: Some(frame_number),
         event_type: event_type.to_string(),
@@ -6828,7 +8131,6 @@ fn add_car_contact_events(
                 values.insert("event_player_2_demolished".to_string(), "false".to_string());
                 add_pbp_players(&mut values, player_static_values);
                 add_frame_state_values(&mut values, context, snapshot.frame_number, players);
-                add_spatial_features(&mut values, players);
                 rows.push(PbpEventRecord {
                     frame_number: Some(snapshot.frame_number),
                     event_type: "bump".to_string(),
@@ -6882,7 +8184,6 @@ fn add_boost_pickup_events(
         }
         add_pbp_players(&mut values, player_static_values);
         add_frame_state_values(&mut values, context, event.frame_number, &context.players);
-        add_spatial_features(&mut values, &context.players);
         rows.push(PbpEventRecord {
             frame_number: Some(event.frame_number),
             event_type: "boost-pickup".to_string(),
@@ -6951,12 +8252,209 @@ fn add_flip_reset_events(
                 );
             }
         }
-        add_spatial_features(&mut values, &context.players);
         rows.push(PbpEventRecord {
             frame_number: Some(event.frame_number),
             event_type: "flip-reset".to_string(),
             values,
         });
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct RotationRunState {
+    role: Option<i32>,
+    start_seconds: f32,
+    stalled_emitted: bool,
+}
+
+fn add_rotation_events(
+    rows: &mut Vec<PbpEventRecord>,
+    context: &PbpContext,
+    player_static_values: &[(String, String)],
+    game_id: &str,
+    match_guid: &str,
+    replay_name: &str,
+    map_id: &str,
+    team_size: Option<i32>,
+    game_time: &str,
+) {
+    let Some(team_size) = team_size else {
+        return;
+    };
+    if team_size <= 1 {
+        return;
+    }
+
+    let mut states = vec![RotationRunState::default(); context.players.len()];
+    let mut roles = vec![None; context.players.len()];
+    for snapshot in &context.frame_states {
+        let Some(ball) = snapshot
+            .ball
+            .filter(|state| state.has_pos)
+            .map(|state| state.pos)
+        else {
+            continue;
+        };
+        let seconds = snapshot
+            .seconds_elapsed
+            .unwrap_or(snapshot.frame_number as f32 / 30.0);
+        fill_rotation_roles_for_snapshot(&mut roles, snapshot, &context.players, ball);
+
+        for (player_idx, player) in context.players.iter().enumerate() {
+            let Some(role) = roles.get(player_idx).copied().flatten() else {
+                continue;
+            };
+            let state = &mut states[player_idx];
+            let Some(previous_role) = state.role else {
+                state.role = Some(role);
+                state.start_seconds = seconds;
+                state.stalled_emitted = false;
+                continue;
+            };
+
+            if previous_role != role {
+                let previous_duration = (seconds - state.start_seconds).max(0.0);
+                if previous_duration >= 0.5 {
+                    let event_type = if rotation_filled(previous_role, role, team_size) {
+                        Some("rotation-filled")
+                    } else if rotation_cut(previous_role, role, team_size) {
+                        Some("rotation-cut")
+                    } else {
+                        None
+                    };
+                    if let Some(event_type) = event_type {
+                        rows.push(build_rotation_event_row(
+                            event_type,
+                            snapshot.frame_number,
+                            previous_duration,
+                            player,
+                            context,
+                            player_static_values,
+                            game_id,
+                            match_guid,
+                            replay_name,
+                            map_id,
+                            Some(team_size),
+                            game_time,
+                        ));
+                    }
+                }
+                state.role = Some(role);
+                state.start_seconds = seconds;
+                state.stalled_emitted = false;
+                continue;
+            }
+
+            if role == 1 && !state.stalled_emitted && seconds - state.start_seconds >= 1.5 {
+                rows.push(build_rotation_event_row(
+                    "rotation-stalled",
+                    snapshot.frame_number,
+                    seconds - state.start_seconds,
+                    player,
+                    context,
+                    player_static_values,
+                    game_id,
+                    match_guid,
+                    replay_name,
+                    map_id,
+                    Some(team_size),
+                    game_time,
+                ));
+                state.stalled_emitted = true;
+            }
+        }
+    }
+}
+
+fn fill_rotation_roles_for_snapshot(
+    roles: &mut [Option<i32>],
+    snapshot: &FrameSnapshot,
+    players: &[PlayerInfo],
+    ball: Vec3,
+) {
+    for role in roles.iter_mut() {
+        *role = None;
+    }
+    for (player_idx, player) in players.iter().enumerate() {
+        let Some(pos) = snapshot
+            .players
+            .get(player_idx)
+            .and_then(Option::as_ref)
+            .filter(|state| state.entity.has_pos)
+            .map(|state| state.entity.pos)
+        else {
+            continue;
+        };
+        let player_ball_distance = vec_distance(pos, ball);
+        let closer_teammates = players
+            .iter()
+            .enumerate()
+            .filter(|(teammate_idx, teammate)| {
+                *teammate_idx != player_idx && teammate.team == player.team
+            })
+            .filter_map(|(teammate_idx, _)| {
+                snapshot
+                    .players
+                    .get(teammate_idx)
+                    .and_then(Option::as_ref)
+                    .filter(|state| state.entity.has_pos)
+                    .map(|state| state.entity.pos)
+            })
+            .filter(|teammate_pos| vec_distance(*teammate_pos, ball) < player_ball_distance)
+            .count();
+        if let Some(role) = roles.get_mut(player_idx) {
+            *role = Some((closer_teammates + 1) as i32);
+        }
+    }
+}
+
+fn rotation_filled(previous_role: i32, role: i32, team_size: i32) -> bool {
+    (previous_role > 1 && role == previous_role - 1) || (previous_role == 1 && role == team_size)
+}
+
+fn rotation_cut(previous_role: i32, role: i32, team_size: i32) -> bool {
+    previous_role - role > 1 || (previous_role == 1 && role > 1 && role != team_size)
+}
+
+fn build_rotation_event_row(
+    event_type: &str,
+    frame_number: i32,
+    event_duration: f32,
+    player: &PlayerInfo,
+    context: &PbpContext,
+    player_static_values: &[(String, String)],
+    game_id: &str,
+    match_guid: &str,
+    replay_name: &str,
+    map_id: &str,
+    team_size: Option<i32>,
+    game_time: &str,
+) -> PbpEventRecord {
+    let mut values = pbp_base_values(
+        game_id,
+        match_guid,
+        replay_name,
+        map_id,
+        context,
+        team_size,
+        game_time,
+    );
+    values.insert("event_type".to_string(), event_type.to_string());
+    values.insert("frame_number".to_string(), frame_number.to_string());
+    values.insert(
+        "observed_frame_number".to_string(),
+        frame_number.to_string(),
+    );
+    values.insert("event_duration".to_string(), event_duration.to_string());
+    values.insert("event_team".to_string(), team_name(player.team).to_string());
+    insert_seconds_elapsed(&mut values, context, frame_number);
+    add_event_player(&mut values, &context.players, 1, &player.name);
+    add_pbp_players(&mut values, player_static_values);
+    add_frame_state_values(&mut values, context, frame_number, &context.players);
+    PbpEventRecord {
+        frame_number: Some(frame_number),
+        event_type: event_type.to_string(),
+        values,
     }
 }
 
@@ -7210,7 +8708,16 @@ fn raw_boost_units(scaled_boost: i32) -> u8 {
 }
 
 fn post_process_pbp_rows(rows: &mut Vec<PbpEventRecord>, players: &[PlayerInfo]) {
-    let touch_types = ["touch", "turnover", "pass", "shot", "goal", "kickoff"];
+    let touch_types = [
+        "touch",
+        "turnover",
+        "pass",
+        "shot",
+        "missed-shot",
+        "missed-pass",
+        "goal",
+        "kickoff",
+    ];
     let slot_by_id = players
         .iter()
         .map(|player| (player.id.clone(), player.slot.clone()))
@@ -7242,7 +8749,10 @@ fn post_process_pbp_rows(rows: &mut Vec<PbpEventRecord>, players: &[PlayerInfo])
             "off_air_dribble",
             "off_ground_dribble",
             "off_flick",
-            "pass_in_play",
+            "off_pass",
+            "off_fake",
+            "off_whiff",
+            "off_rotation_cut",
             "aerialing",
             "air_dribble",
             "ground_dribble",
@@ -7272,6 +8782,8 @@ fn post_process_pbp_rows(rows: &mut Vec<PbpEventRecord>, players: &[PlayerInfo])
         }
         add_event_location_flags(&mut row.values, &slot_by_id);
     }
+
+    add_double_commit_events(rows, players, &slot_by_id);
 
     for idx in 0..rows.len() {
         if rows[idx].event_type == "bump" {
@@ -7574,7 +9086,10 @@ fn post_process_pbp_rows(rows: &mut Vec<PbpEventRecord>, players: &[PlayerInfo])
     add_weighted_event_history(rows);
 
     for idx in 0..rows.len() {
-        if rows[idx].event_type != "shot" && rows[idx].event_type != "goal" {
+        if !matches!(
+            rows[idx].event_type.as_str(),
+            "shot" | "goal" | "missed-shot"
+        ) {
             continue;
         }
         let seconds = match row_f32(&rows[idx].values, "seconds_elapsed") {
@@ -7594,7 +9109,7 @@ fn post_process_pbp_rows(rows: &mut Vec<PbpEventRecord>, players: &[PlayerInfo])
                 break;
             }
             if delta <= REBOUND_SECONDS
-                && (prior.event_type == "shot" || prior.event_type == "goal")
+                && matches!(prior.event_type.as_str(), "shot" | "goal" | "missed-shot")
             {
                 flags.insert("rebound", true);
             }
@@ -7623,7 +9138,19 @@ fn post_process_pbp_rows(rows: &mut Vec<PbpEventRecord>, players: &[PlayerInfo])
                 && prior.event_type == "pass"
                 && row_string(&prior.values, "event_team") == team
             {
-                flags.insert("pass_in_play", true);
+                flags.insert("off_pass", true);
+            }
+            if delta <= OFF_CHALLENGE_SECONDS
+                && prior.event_type == "fake"
+                && row_string(&prior.values, "event_team") == team
+            {
+                flags.insert("off_fake", true);
+            }
+            if delta <= OFF_CHALLENGE_SECONDS
+                && prior.event_type == "whiff"
+                && row_string(&prior.values, "event_team") != team
+            {
+                flags.insert("off_whiff", true);
             }
             let same_shooter = row_string(&prior.values, "event_player_1_id") == shooter_id;
             if delta <= DRIBBLE_WINDOW_SECONDS && prior.event_type == "air-dribble" && same_shooter
@@ -7647,15 +9174,86 @@ fn post_process_pbp_rows(rows: &mut Vec<PbpEventRecord>, players: &[PlayerInfo])
             flags.insert("double_tap", true);
             flags.insert("off_double_tap", true);
         }
+        if shot_has_rotation_cut_context(rows, idx, &slot_by_id) {
+            flags.insert("off_rotation_cut", true);
+        }
         for (key, value) in flags {
             rows[idx].values.insert(key.to_string(), value.to_string());
         }
         if !row_string(&rows[idx].values, "event_player_2_id").is_empty() {
             rows[idx]
                 .values
-                .insert("pass_in_play".to_string(), "true".to_string());
+                .insert("off_pass".to_string(), "true".to_string());
         }
     }
+}
+
+fn add_double_commit_events(
+    rows: &mut Vec<PbpEventRecord>,
+    players: &[PlayerInfo],
+    slot_by_id: &HashMap<String, String>,
+) {
+    let mut additions = Vec::new();
+    let mut last_by_pair: HashMap<(String, String), i32> = HashMap::new();
+    for row in rows.iter() {
+        if !ball_contact_event(&row.event_type) {
+            continue;
+        }
+        let player_id = row_string(&row.values, "event_player_1_id");
+        let team = row_string(&row.values, "event_player_1_team");
+        if player_id.is_empty() || team.is_empty() {
+            continue;
+        }
+        let frame_number = row.frame_number.unwrap_or(i32::MAX);
+        let Some(player_slot) = slot_by_id.get(&player_id) else {
+            continue;
+        };
+        let teammate = players
+            .iter()
+            .filter(|player| player.id != player_id && team_name(player.team) == team)
+            .filter_map(|player| {
+                let ball_distance =
+                    row_f32(&row.values, &format!("{}_distance_to_ball", player.slot))?;
+                let teammate_distance = row_f32(
+                    &row.values,
+                    &format!("{player_slot}_distance_to_{}", player.slot),
+                )
+                .unwrap_or(f32::MAX);
+                (ball_distance <= DOUBLE_COMMIT_BALL_DISTANCE
+                    && teammate_distance <= DOUBLE_COMMIT_TEAMMATE_DISTANCE)
+                    .then_some((player, ball_distance))
+            })
+            .min_by(|left, right| {
+                left.1
+                    .partial_cmp(&right.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        let Some((teammate, _)) = teammate else {
+            continue;
+        };
+        let mut pair = [player_id.clone(), teammate.id.clone()];
+        pair.sort();
+        let key = (pair[0].clone(), pair[1].clone());
+        if last_by_pair
+            .get(&key)
+            .map(|prior_frame| frame_number - *prior_frame <= DOUBLE_COMMIT_COOLDOWN_FRAMES)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        last_by_pair.insert(key, frame_number);
+
+        let mut values = row.values.clone();
+        values.insert("event_type".to_string(), "double-commit".to_string());
+        add_event_player(&mut values, players, 2, &teammate.name);
+        clear_official_stat_values(&mut values);
+        additions.push(PbpEventRecord {
+            frame_number: row.frame_number,
+            event_type: "double-commit".to_string(),
+            values,
+        });
+    }
+    rows.extend(additions);
 }
 
 fn add_contact_microstat_flags(rows: &mut [PbpEventRecord], slot_by_id: &HashMap<String, String>) {
@@ -7799,14 +9397,31 @@ fn clear_official_stat_values(values: &mut RowValues) {
 fn microstat_contact_event(event_type: &str) -> bool {
     matches!(
         event_type,
-        "touch" | "turnover" | "pass" | "shot" | "goal" | "kickoff" | "challenge" | "bump"
+        "touch"
+            | "turnover"
+            | "pass"
+            | "shot"
+            | "missed-shot"
+            | "missed-pass"
+            | "goal"
+            | "kickoff"
+            | "challenge"
+            | "bump"
     )
 }
 
 fn ball_contact_event(event_type: &str) -> bool {
     matches!(
         event_type,
-        "touch" | "turnover" | "pass" | "shot" | "goal" | "kickoff" | "challenge"
+        "touch"
+            | "turnover"
+            | "pass"
+            | "shot"
+            | "missed-shot"
+            | "missed-pass"
+            | "goal"
+            | "kickoff"
+            | "challenge"
     )
 }
 
@@ -7861,6 +9476,46 @@ fn shot_is_double_tap(
         }
         break;
     }
+    false
+}
+
+fn shot_has_rotation_cut_context(
+    rows: &[PbpEventRecord],
+    shot_idx: usize,
+    slot_by_id: &HashMap<String, String>,
+) -> bool {
+    let shot = &rows[shot_idx];
+    let shooter_id = row_string(&shot.values, "event_player_1_id");
+    let Some(slot) = slot_by_id.get(&shooter_id) else {
+        return false;
+    };
+    let Some(current_role) = row_f32(&shot.values, &format!("{slot}_rotation_role")) else {
+        return false;
+    };
+    let team_size = row_f32(&shot.values, "team_size").unwrap_or(0.0);
+    if team_size <= 1.0 {
+        return false;
+    }
+
+    for prior in rows[..shot_idx].iter().rev() {
+        if prior.event_type == "kickoff" || prior.event_type == "goal" {
+            break;
+        }
+        if row_string(&prior.values, "event_player_1_id") != shooter_id {
+            continue;
+        }
+        let Some(previous_role) = row_f32(&prior.values, &format!("{slot}_rotation_role")) else {
+            continue;
+        };
+        if (previous_role - current_role).abs() < f32::EPSILON {
+            return false;
+        }
+        if previous_role <= 1.0 {
+            return (current_role - team_size).abs() >= f32::EPSILON;
+        }
+        return current_role < previous_role - 1.0;
+    }
+
     false
 }
 
@@ -7946,8 +9601,10 @@ fn add_zone_context_flags(rows: &mut [PbpEventRecord]) {
         if team.is_empty() {
             continue;
         }
-        let allow_entry_exit = !matches!(rows[idx].event_type.as_str(), "shot" | "goal")
-            || event_in_offensive_third(&rows[idx].values, &team);
+        let allow_entry_exit = !matches!(
+            rows[idx].event_type.as_str(),
+            "shot" | "goal" | "missed-shot"
+        ) || event_in_offensive_third(&rows[idx].values, &team);
         let mut off_controlled_entry = false;
         let mut off_controlled_exit = false;
         let mut off_retrieval = false;
@@ -8076,7 +9733,7 @@ fn add_weighted_event_history(rows: &mut [PbpEventRecord]) {
             kickoff_seconds = Some(seconds);
         }
 
-        if row.event_type == "shot" || row.event_type == "goal" {
+        if matches!(row.event_type.as_str(), "shot" | "goal" | "missed-shot") {
             if let Some(start_seconds) = kickoff_seconds {
                 set_float(
                     &mut row.values,
@@ -8186,9 +9843,7 @@ fn row_vec(values: &RowValues, prefix: &str, field_prefix: &str) -> Option<Vec3>
 
 fn set_float(values: &mut RowValues, key: &str, value: Option<f32>) {
     if let Some(value) = value {
-        if value.is_finite() {
-            values.insert(key.to_string(), value.to_string());
-        }
+        values.insert_f32(key, value);
     }
 }
 
@@ -8349,6 +10004,7 @@ fn pbp_columns() -> Vec<String> {
         "boost_pickup_type",
         "reset_origin",
         "event_length",
+        "event_duration",
         "off_demo",
         "off_kickoff",
         "off_challenge_win",
@@ -8361,7 +10017,10 @@ fn pbp_columns() -> Vec<String> {
         "off_air_dribble",
         "off_ground_dribble",
         "off_flick",
-        "pass_in_play",
+        "off_pass",
+        "off_fake",
+        "off_whiff",
+        "off_rotation_cut",
         "aerialing",
         "air_dribble",
         "ground_dribble",
@@ -8402,6 +10061,10 @@ fn pbp_columns() -> Vec<String> {
         "event_player_2_actor_id",
         "event_player_2_name",
         "event_player_2_team",
+        "event_player_3_id",
+        "event_player_3_actor_id",
+        "event_player_3_name",
+        "event_player_3_team",
         "linked_shot_observed_frame_number",
         "linked_shot_recorded_frame_number",
         "collision_distance",
@@ -8452,14 +10115,29 @@ fn pbp_columns() -> Vec<String> {
         "network_id",
         "name",
         "platform",
-        "title_id",
         "is_bot",
-        "first_frame_in_game",
+        "score",
         "time_in_game",
-        "party_leader_id",
         "mmr",
         "car_id",
         "car_name",
+        "decal_id",
+        "wheels_id",
+        "boost_id",
+        "antenna_id",
+        "topper_id",
+        "engine_audio_id",
+        "trail_id",
+        "goal_explosion_id",
+        "primary_paint_finish_id",
+        "accent_paint_finish_id",
+        "camera_fov",
+        "camera_height",
+        "camera_angle",
+        "camera_distance",
+        "camera_stiffness",
+        "camera_swivel",
+        "camera_transition",
         "pos_x",
         "pos_y",
         "pos_z",
@@ -8472,7 +10150,6 @@ fn pbp_columns() -> Vec<String> {
         "rot_x",
         "rot_y",
         "rot_z",
-        "boost_raw",
         "boost",
         "boost_active",
         "boost_collect",
@@ -8485,13 +10162,10 @@ fn pbp_columns() -> Vec<String> {
         "double_jump_active",
         "jumped",
         "flipped",
-        "jump_air_activate_count",
-        "double_jump_air_activate_count",
-        "dodge_air_activate_count",
-        "dodges_refreshed_counter",
         "supersonic",
         "distance_to_ball",
         "angle_to_ball",
+        "rotation_role",
         "distance_to_own_net",
         "angle_to_own_net",
         "distance_to_opp_net",
@@ -8502,9 +10176,11 @@ fn pbp_columns() -> Vec<String> {
         "blue_player_1",
         "blue_player_2",
         "blue_player_3",
+        "blue_player_4",
         "orange_player_1",
         "orange_player_2",
         "orange_player_3",
+        "orange_player_4",
     ];
 
     for slot in slots {

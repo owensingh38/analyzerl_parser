@@ -1,5 +1,3 @@
-"""Replay animation helpers backed by the bundled AnalyzeRL parser."""
-
 import csv
 import io
 import json
@@ -9,7 +7,6 @@ import subprocess
 import sys
 import time
 from typing import Any, Literal
-
 from .parse import _boxcars_binary
 
 np = None

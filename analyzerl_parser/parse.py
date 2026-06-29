@@ -1,5 +1,3 @@
-"""Python helpers for running the bundled AnalyzeRL replay parser."""
-
 import os
 import shutil
 import subprocess
@@ -9,8 +7,9 @@ from typing import Iterable, Literal, Sequence, TypeAlias
 
 ReplayPathInput: TypeAlias = str | os.PathLike[str] | Sequence[str | os.PathLike[str]]
 ReturnType: TypeAlias = Literal["export", "pandas", "polars"]
-OutputType: TypeAlias = Literal["frames", "pbp"]
+OutputType: TypeAlias = Literal["frames", "frames-only", "pbp"]
 ExportFormat: TypeAlias = Literal["csv", "parquet"]
+GpuMode: TypeAlias = Literal["auto", "cuda", "rocm"]
 
 _DATA_DIR = Path.cwd()
 _CSV_FLOAT_COLUMNS = (
@@ -63,7 +62,7 @@ def _ensure_executable(path):
     if sys.platform.startswith("win"):
         return path
 
-    #Installed Linux wheels may need the bundled binary made executable.
+    # Installed Linux wheels may need the bundled binary made executable.
     mode = path.stat().st_mode
     if mode & 0o111 == 0:
         try:
@@ -88,7 +87,7 @@ def _copy_binary_to_user_cache(source):
     cache_dir.mkdir(parents=True, exist_ok=True)
     target = cache_dir / source.name
 
-    #Fall back to a user-writable binary path when site-packages is read-only.
+    # Fall back to a user-writable binary path when site-packages is read-only.
     should_copy = True
     if target.exists():
         source_stat = source.stat()
@@ -113,7 +112,7 @@ def _boxcars_binary():
 
     package_file = Path(__file__).resolve()
 
-    #Prefer packaged binaries, then local development builds, then PATH.
+    # Prefer packaged binaries, then local development builds, then PATH.
     candidates = [
         package_file.parent / "bin" / exe_name,
         package_file.parent.parent / "analyzerl_boxcars" / "target" / "release" / exe_name,
@@ -150,6 +149,19 @@ def _run_boxcars(command):
         subprocess.run([str(cached_binary), *command[1:]], check=True)
 
 
+def _gpu_mode(gpu: GpuMode | str | None) -> str | None:
+    if gpu is None:
+        return None
+    value = str(gpu).lower()
+    if value == "auto":
+        return "auto"
+    if value in {"rocm", "amd", "radeon"}:
+        return "rocm"
+    if value in {"cuda", "nvidia"}:
+        return "cuda"
+    raise ValueError("gpu must be None, 'auto', 'cuda', or 'rocm'")
+
+
 def _replay_files(replay_path: ReplayPathInput) -> list[Path]:
     if isinstance(replay_path, (list, tuple, set)):
         paths = []
@@ -182,21 +194,27 @@ def _replay_files(replay_path: ReplayPathInput) -> list[Path]:
     raise FileNotFoundError(f"Replay path does not exist: {replay_path}")
 
 
-def _prepare_replay_inputs(replay_path: ReplayPathInput) -> list[Path]:
-    replay_files = _replay_files(replay_path)
-
-    #Keep a single folder intact so the Rust parser can batch it efficiently.
+def _prepare_replay_inputs(
+    replay_path: ReplayPathInput,
+    replay_files: Sequence[Path] | None = None,
+) -> list[Path]:
+    # Keep a single folder intact so the Rust parser can batch it efficiently.
     if not isinstance(replay_path, (list, tuple, set)):
         resolved = _path(replay_path)
 
         if resolved.is_dir():
-            direct_replays = sorted(resolved.glob("*.replay"))
-            recursive_replays = _replay_files(resolved)
+            recursive_replays = list(replay_files) if replay_files is not None else _replay_files(resolved)
+            direct_replays = [path for path in recursive_replays if path.parent == resolved]
             if len(direct_replays) == len(recursive_replays):
                 return [resolved]
             return recursive_replays
 
-    return replay_files
+        if resolved.is_file():
+            if resolved.suffix.lower() != ".replay":
+                raise ValueError(f"Not a .replay file: {resolved}")
+            return [resolved]
+
+    return list(replay_files) if replay_files is not None else _replay_files(replay_path)
 
 
 def _apply_limit(replay_inputs: list[Path], limit: int | None) -> list[Path]:
@@ -217,17 +235,20 @@ def _output_config(
     output = str(output).lower()
     export_format = None if export_format is None else str(export_format).lower()
 
-    if output == "frames":
+    if output in {"frames", "frames-only"}:
         export_format = export_format or "parquet"
         if export_format not in {"csv", "parquet"}:
             raise ValueError("export_format must be one of: 'csv', 'parquet'")
-        return {
+        config = {
             "command": "frames",
             "out_arg": "--out-frames",
             "glob": f"*_frames.{export_format}",
             "suffix": "_frames",
             "format": export_format,
         }
+        if output == "frames-only":
+            config["mode_arg"] = "--frames-only"
+        return config
 
     if output == "pbp":
         export_format = export_format or "csv"
@@ -241,15 +262,14 @@ def _output_config(
             "format": export_format,
         }
 
-    raise ValueError("output must be one of: 'frames', 'pbp'")
+    raise ValueError("output must be one of: 'frames', 'frames-only', 'pbp'")
 
 
 def _export_path_config(
     export: str | os.PathLike[str],
     output: OutputType | str,
     export_format: ExportFormat | str | None,
-    replay_path: ReplayPathInput,
-    limit: int | None,
+    replay_count: int,
 ) -> tuple[Path, Path | None, dict[str, str]]:
     export_path = _path(export)
     suffix = export_path.suffix.lower()
@@ -259,7 +279,6 @@ def _export_path_config(
         inferred_format = suffix[1:]
         if export_format is not None and str(export_format).lower() != inferred_format:
             raise ValueError("export_format conflicts with the export path suffix")
-        replay_count = len(_apply_limit(_replay_files(replay_path), limit))
         if replay_count != 1:
             raise ValueError("file export paths can only be used with exactly one replay")
         export_format = inferred_format
@@ -270,12 +289,10 @@ def _export_path_config(
 
 
 def _expected_export_files(
-    replay_path: ReplayPathInput,
+    replay_files: Sequence[Path],
     export_path: Path,
     config: dict[str, str],
-    limit: int | None,
 ) -> list[Path]:
-    replay_files = _apply_limit(_replay_files(replay_path), limit)
     return [
         export_path / f"{path.stem}{config['suffix']}.{config['format']}"
         for path in replay_files
@@ -283,15 +300,14 @@ def _expected_export_files(
 
 
 def _actual_export_files(
-    replay_path: ReplayPathInput,
+    replay_files: Sequence[Path],
     export_path: Path,
     config: dict[str, str],
-    limit: int | None,
     file_target: Path | None = None,
 ) -> list[Path]:
     expected = [
         path
-        for path in _expected_export_files(replay_path, export_path, config, limit)
+        for path in _expected_export_files(replay_files, export_path, config)
         if path.exists()
     ]
 
@@ -391,6 +407,8 @@ def parse_replay(
     force: bool = False,
     limit: int | None = None,
     xg_model_path: str | os.PathLike[str] | None = None,
+    gpu: GpuMode | str | None = None,
+    rotation_events: bool = True,
 ):
     """Parse one or more Rocket League replays with the bundled Rust CLI.
 
@@ -410,6 +428,11 @@ def parse_replay(
         xg_model_path: Optional saved xG model file or folder. When provided,
             parsed PBP or frame exports are scored and an ``xG`` column is
             added to shot and goal rows.
+        gpu: Optional parser GPU mode. Python ``None`` is the default and uses
+            CPU only; ``"auto"``, ``"cuda"``, and ``"rocm"`` request GPU.
+        rotation_events: Whether to add ``rotation-filled``,
+            ``rotation-cut``, and ``rotation-stalled`` event rows. Defaults
+            to ``True``.
 
     Returns:
         A list of exported file paths, a pandas DataFrame, or a Polars
@@ -429,47 +452,52 @@ def parse_replay(
     if export is None:
         raise ValueError("export cannot be None")
 
+    replay_files = _apply_limit(_replay_files(replay_path), limit)
     export_path, file_target, config = _export_path_config(
         export,
         output,
         export_format,
-        replay_path,
-        limit,
+        len(replay_files),
     )
     export_path.mkdir(parents=True, exist_ok=True)
-    replay_inputs = _apply_limit(_prepare_replay_inputs(replay_path), limit)
-    expected_count = len(_apply_limit(_replay_files(replay_path), limit))
+    replay_inputs = _prepare_replay_inputs(replay_path, replay_files)
+    expected_count = len(replay_files)
 
     workers = max(int(workers or 1), 1)
     binary = _boxcars_binary()
     export_files = []
 
+    command = [
+        binary,
+        config["command"],
+        "--workers",
+        str(workers),
+    ]
     for replay_input in replay_inputs:
-        command = [
-            binary,
-            config["command"],
-            "--replays",
-            str(replay_input),
-            "--workers",
-            str(workers),
-        ]
+        command.extend(["--replays", str(replay_input)])
 
-        command.extend([config["out_arg"], str(export_path)])
-        command.extend(["--format", config["format"]])
+    command.extend([config["out_arg"], str(export_path)])
+    command.extend(["--format", config["format"]])
+    gpu_mode = _gpu_mode(gpu)
+    if gpu_mode is not None:
+        command.extend(["--gpu", gpu_mode])
+    if "mode_arg" in config:
+        command.append(config["mode_arg"])
+    if not rotation_events:
+        command.append("--no-rotation-events")
 
-        if limit is not None and Path(replay_input).is_dir():
-            command.extend(["--limit", str(int(limit))])
+    if limit is not None:
+        command.extend(["--limit", str(int(limit))])
 
-        if force:
-            command.append("--force")
+    if force:
+        command.append("--force")
 
-        _run_boxcars(command)
+    _run_boxcars(command)
 
     export_files = _actual_export_files(
-        replay_path,
+        replay_files,
         export_path,
         config,
-        limit,
         file_target=file_target,
     )
     _assert_export_files(export_files, expected_count)

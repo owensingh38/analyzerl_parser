@@ -1,17 +1,16 @@
-"""Public Python API for the AnalyzeRL parser package."""
-
 from os import PathLike
-from typing import Any, Literal, Sequence, TypeAlias
+from typing import Literal, Sequence, TypeAlias
 
 ReplayPathInput: TypeAlias = str | PathLike[str] | Sequence[str | PathLike[str]]
 StatsInput: TypeAlias = str | PathLike[str] | Sequence[str | PathLike[str]]
 ReturnType: TypeAlias = Literal["export", "pandas", "polars"]
-OutputType: TypeAlias = Literal["frames", "pbp"]
+OutputType: TypeAlias = Literal["frames", "frames-only", "pbp"]
 ExportFormat: TypeAlias = Literal["csv", "parquet"]
-StatsReturnType: TypeAlias = Literal["polars", "pandas", "list"]
+GpuMode: TypeAlias = Literal["auto", "cuda", "rocm"]
+StatsReturnType: TypeAlias = Literal["export", "polars", "pandas", "list"]
 RenderMode: TypeAlias = Literal["2d", "3d"]
 
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 
 def parse_replay(
     replay_path: ReplayPathInput = "data/replays",
@@ -23,6 +22,8 @@ def parse_replay(
     force: bool = False,
     limit: int | None = None,
     xg_model_path: str | PathLike[str] | None = None,
+    gpu: GpuMode | str | None = None,
+    rotation_events: bool = True,
 ):
     """Parse one or more replays into play-by-play or analyzed frame exports.
 
@@ -33,13 +34,17 @@ def parse_replay(
         workers: Number of Rust parser worker threads to use.
         return_type: Whether to return export paths, pandas data, or Polars
             data.
-        output: Export mode, either ``frames`` or ``pbp``.
+        output: Export mode, either ``frames``, ``frames-only``, or ``pbp``.
         export_format: File format for the exports.
         force: Whether to overwrite existing exports.
         limit: Optional replay count limit when parsing a directory.
         xg_model_path: Optional saved xG model file or folder. When provided,
             parsed PBP or frame exports receive an ``xG`` column on shot and
             goal rows.
+        gpu: Optional parser GPU mode. Python ``None`` is the default and uses
+            CPU only.
+        rotation_events: Whether to add rotation event rows. Defaults to
+            ``True``.
 
     Returns:
         Parser output in the format requested by ``return_type``.
@@ -56,6 +61,8 @@ def parse_replay(
         force=force,
         limit=limit,
         xg_model_path=xg_model_path,
+        gpu=gpu,
+        rotation_events=rotation_events,
     )
 
 
@@ -70,6 +77,7 @@ def calculate_stats(
     force: bool = False,
     limit: int | None = None,
     xg_model_path: str | PathLike[str] | None = None,
+    gpu: GpuMode | str | None = None,
 ):
     """Aggregate per-player replay stats from replay, PBP, or frame data.
 
@@ -77,7 +85,7 @@ def calculate_stats(
         frames: Replay file, replay folder, one or more replay files, CSV or
             Parquet PBP/frame file, folder of CSV or Parquet PBP/frame files,
             or one or more CSV or Parquet PBP/frame files.
-        return_type: Whether to return Polars, pandas, or list output.
+        return_type: Whether to return the export path, Polars, pandas, or list output.
         export: Optional destination path for the aggregated stats table.
         group_by: Output grouping columns. Defaults to ``["replay_id",
             "player_id"]``.
@@ -90,6 +98,8 @@ def calculate_stats(
         limit: Optional file or replay count limit.
         xg_model_path: Optional saved xG model file or folder. When provided,
             source rows are scored before expected-goal stats are aggregated.
+        gpu: Optional parser GPU mode when replay inputs need Rust parsing.
+            Python ``None`` is the default and uses CPU only.
 
     Returns:
         Aggregated replay stats in the requested format.
@@ -107,6 +117,7 @@ def calculate_stats(
         force=force,
         limit=limit,
         xg_model_path=xg_model_path,
+        gpu=gpu,
     )
 
 

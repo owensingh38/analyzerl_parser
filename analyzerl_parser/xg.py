@@ -2,9 +2,11 @@ import os
 import json
 import gc
 import warnings
+from threading import Lock
 import joblib
 import numpy as np
 import polars as pl
+import xgboost as xgb
 from os import PathLike
 from pathlib import Path
 from scipy import sparse
@@ -14,7 +16,6 @@ from sklearn.metrics import average_precision_score, brier_score_loss, log_loss,
 from sklearn.model_selection import GroupKFold, GroupShuffleSplit
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.isotonic import IsotonicRegression
-import xgboost as xgb
 
 try:
     import optuna
@@ -26,6 +27,8 @@ if optuna is not None:
 
 PBP_FOLDER = 'data/frames'
 MODEL_FOLDER = 'data/models/xg'
+_XG_ARTIFACT_CACHE: dict[Path, dict[str, Any]] = {}
+_XG_ARTIFACT_CACHE_LOCK = Lock()
 XG_LABEL = 'standard'
 REQUIRED_ARTIFACT_KEYS = {
     'model',
@@ -34,20 +37,13 @@ REQUIRED_ARTIFACT_KEYS = {
     'categorical_cols',
 }
 SUPPORTED_INPUT_SUFFIXES = {'.csv', '.parquet'}
-SIDE_WALL_X = 4096.0
 BACK_WALL_Y = 5120.0
 BACK_NET_Y = 6000.0
-CEILING_Z = 2044.0
 GOAL_HEIGHT = 642.775
 GOAL_CENTER_TO_POST = 892.755
 GRAVITY = 650.0
 BALL_RADIUS = 91.25
 SUPERSONIC_THRESHOLD = 2200.0
-GROUND_Z = 40.0
-WALL_DISTANCE = 350.0
-FIELD_X = SIDE_WALL_X
-FIELD_Y = BACK_WALL_Y
-FIELD_Z = CEILING_Z
 SHOT_GOAL_PROJECTION_MAX_SECONDS = 5.0
 MISSING_OPPONENT_POSITION = 1_000_000.0
 CAR_INTERCEPT_MIN_SPEED = 500.0
@@ -181,7 +177,10 @@ CONTEXT_EVENT_FRAME_BOOLEAN = [
     'off_air_dribble',
     'off_ground_dribble',
     'off_flick',
-    'pass_in_play',
+    'off_pass',
+    'off_fake',
+    'off_whiff',
+    'off_rotation_cut',
     'rebound',
     'off_flip_reset',
     'off_double_tap',
@@ -413,7 +412,7 @@ def scan_pbp_polars(paths, requested_columns=None, event_filter=True):
             )
         lazy_frame = scan.select(select_exprs).select(requested)
         if event_filter:
-            lazy_frame = lazy_frame.filter(pl.col('event_type').is_in(['shot', 'goal']))
+            lazy_frame = lazy_frame.filter(pl.col('event_type').is_in(['shot', 'goal', 'missed-shot']))
         lazy_frames.append(lazy_frame)
 
     return pl.concat(lazy_frames, how='vertical_relaxed')
@@ -443,7 +442,7 @@ def scan_single_pbp_polars(path, requested, event_filter=True):
         )
     lazy_frame = scan.select(select_exprs).select(requested)
     if event_filter:
-        lazy_frame = lazy_frame.filter(pl.col('event_type').is_in(['shot', 'goal']))
+        lazy_frame = lazy_frame.filter(pl.col('event_type').is_in(['shot', 'goal', 'missed-shot']))
     return lazy_frame
 
 
@@ -470,6 +469,7 @@ def collect_pbp_polars_skip_corrupt_parquet(paths, requested_columns=None, event
 def prepare_model_shots(lazy_frame):
     shot_event = (
         (pl.col('event_type') == 'shot')
+        | (pl.col('event_type') == 'missed-shot')
         | (
             (pl.col('event_type') == 'goal')
             & pl.col('official_shot')
@@ -1917,8 +1917,8 @@ def train_segment(
     model_folder: str | Path,
     return_scored: bool = False,
     nested: bool = True,
-    folds: int = 3,
-    iters: int = 0,
+    folds: int = 5,
+    iters: int = 20,
     jobs: int | None = None,
     params: Mapping[str, Any] | None = None,
     space: Mapping[str, Any] | None = None,
@@ -2269,29 +2269,35 @@ def _resolve_model_file(xg_model_path: str | PathLike[str]) -> Path:
 
 def load_xg_artifact(xg_model_path: str | PathLike[str]) -> dict[str, Any]:
     """Load and validate a saved AnalyzeRL xG model artifact."""
-    try:
-        from sklearn.exceptions import InconsistentVersionWarning
-    except ImportError:  # pragma: no cover - sklearn is an xG dependency
-        InconsistentVersionWarning = UserWarning
+    model_file = _resolve_model_file(xg_model_path)
+    with _XG_ARTIFACT_CACHE_LOCK:
+        cached = _XG_ARTIFACT_CACHE.get(model_file)
+        if cached is not None:
+            return cached
+        try:
+            from sklearn.exceptions import InconsistentVersionWarning
+        except ImportError:  # pragma: no cover - sklearn is an xG dependency
+            InconsistentVersionWarning = UserWarning
 
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            'ignore',
-            message=r'.*If you are loading a serialized model.*',
-            category=UserWarning,
-        )
-        warnings.filterwarnings('ignore', category=InconsistentVersionWarning)
-        artifact = joblib.load(_resolve_model_file(xg_model_path))
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                'ignore',
+                message=r'.*If you are loading a serialized model.*',
+                category=UserWarning,
+            )
+            warnings.filterwarnings('ignore', category=InconsistentVersionWarning)
+            artifact = joblib.load(model_file)
 
-    if not isinstance(artifact, dict):
-        raise ValueError('xG model artifact must be a dict saved by analyzerl_xg')
+        if not isinstance(artifact, dict):
+            raise ValueError('xG model artifact must be a dict saved by analyzerl_xg')
 
-    missing = sorted(REQUIRED_ARTIFACT_KEYS - set(artifact))
-    if missing:
-        raise ValueError(f'xG model artifact is missing required keys: {missing}')
-    if not artifact['numeric_cols'] and not artifact['categorical_cols']:
-        raise ValueError('xG model artifact does not define any feature columns')
-    return artifact
+        missing = sorted(REQUIRED_ARTIFACT_KEYS - set(artifact))
+        if missing:
+            raise ValueError(f'xG model artifact is missing required keys: {missing}')
+        if not artifact['numeric_cols'] and not artifact['categorical_cols']:
+            raise ValueError('xG model artifact does not define any feature columns')
+        _XG_ARTIFACT_CACHE[model_file] = artifact
+        return artifact
 
 
 def xg_model_source_columns() -> list[str]:

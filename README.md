@@ -45,6 +45,18 @@ pbp = analyzerl_parser.parse_replay(
 )
 ```
 
+Export frame-by-frame state without event tagging:
+
+```python
+frames = analyzerl_parser.parse_replay(
+    replay_path="data/replays",
+    export="data/frames",
+    output="frames-only",
+    export_format="parquet",
+    return_type="export",
+)
+```
+
 Calculate player stats from replay files, PBP exports, frame exports, or already-loaded tabular data:
 
 ```python
@@ -54,17 +66,13 @@ stats = analyzerl_parser.calculate_stats(
 )
 ```
 
-## Python API
-
-`parse_replay(replay_path="data/replays", export="data/frames", workers=4, return_type="export", output="frames", export_format=None, force=False, limit=None, xg_model_path=None)` parses one replay, a folder of replays, or a sequence of replay files and folders. `output` is `"frames"` or `"pbp"`. `export_format` is `"csv"` or `"parquet"`; when omitted, frames default to Parquet and PBP defaults to CSV. `return_type` is `"export"`, `"polars"`, or `"pandas"`. `limit` caps the number of replay inputs used from folders, and `force=True` overwrites existing exports. Set `xg_model_path` to an AnalyzeRL xG model file or folder when parsing PBP or frame output to add an `xG` column to shot and goal events.
-
-`calculate_stats(frames, return_type="polars", export=None, group_by=None, rates=False, workers=4, parse_export="data/frames", force=False, limit=None, xg_model_path=None)` aggregates replay stats. The `frames` argument can be a replay file, folder of replays, one or more replay paths, a folder of PBP files, one or more PBP files, a folder of frame files, one or more frame files, or parsed tabular data. Replay inputs are parsed to PBP Parquet before stats are calculated. Stats files are processed in parallel according to `workers`, with single-line replay progress printed as each batch completes. `group_by` defaults to `["replay_id", "player_id"]` and can be any columns in the stats output, such as `["player_id"]`, `["team"]`, or `["replay_id", "team"]`. Set `rates=True` to add per-five-minute and per-game rate columns using normalized time on field and games played. Set `xg_model_path` to an AnalyzeRL xG model file or folder to score source rows before expected-goal stats are aggregated. `return_type` is `"polars"`, `"pandas"`, or `"list"`. When `export` is provided, the output format is inferred from the path suffix, which must be `.csv` or `.parquet`.
-
-`animate_replay(replay_path, event_window_frames=45, event_types=None, start_frame=None, end_frame=None, parser_path=None, render_mode="3d", export_path=None, view_elev=28, view_azim=-64, xg_model_path=None)` renders an interactive replay view or exports a GIF or MP4 at 30 fps and 1x replay speed. `render_mode` is `"2d"` or `"3d"`. `event_types` accepts a comma-separated filter such as `"shot,goal,demo"`, and `xg_model_path` can point at a saved AnalyzeRL xG model so shot and goal labels include xG.
-
 ## Exports
 
-PBP exports contain one row per detected event and include `event_type`, replay identity, frame timing, player and team identity, ball and car state, snf event-specific fields for shot and goal rows. Frame exports contain analyzed all of this information in addition to extra rows for all frames in the match.
+PBP exports contain one row per detected event and include `event_type`, replay identity, frame timing, player and team identity, ball and car state, and event-specific fields for shot and goal rows. Event rows include `event_length`, the seconds until the next event row, and `event_duration`, the intrinsic duration of an event when that event has its own span. Time-on-field and event-interval stats use `event_length`; `event_duration` can overlap other events and is not used as the between-event interval. Frame exports contain all of this information in addition to extra rows for all frames in the match. Frame-only exports contain frame-by-frame car, ball, and spatial state without event tagging or event overlays.
+
+Row exports avoid per-row JSON payload columns. Metadata, player, actor, and attribute exports keep scalar fields only; full replay JSON is written only when the explicit JSON export mode is requested.
+
+Each player slot includes a team-relative `rotation_role` column, such as `blue_player_1_rotation_role`. The role is `1` for the player closest to the ball on their own team, `2` for second closest, and so on through the team size. Empty player or ball state leaves the value null.
 
 Export filenames are keyed by the input replay name:
 
@@ -75,95 +83,190 @@ Export filenames are keyed by the input replay name:
 {replay_name}_frames.parquet
 ```
 
-## Stats
-
-By default, `calculate_stats` returns one row per player per replay. It includes core scoring, shooting, assists, shot assists, expected goals, expected assists, saves, touches, passes, turnovers, challenges, kickoffs, demos, bumps, entries, exits, retrievals, dribbles, flicks, flip resets, boost pickups, and boost totals when the source data contains those fields. Entries and exits include controlled and uncontrolled splits for player totals and for/against totals. Boost amounts use the 0-100 boost scale. Pad counts and amounts are split into small and big pickups, with `stolen` identifying pickups in the opposing team's third and `protected` identifying pickups in the player's own third; kickoff boost resets are not counted as pads.
-
-For and against columns are limited to goals, shots, expected goals, entries, exits, and demos. Other events are exposed as direct player counts or received/taken counts where that direction is part of the event itself.
-
 ## PBP event types
 
-The parser tags frames with `event_type` as a labelling events which frequently occur in Rocket League matches.  Some labels are created directly from first-pass detection, while others are promoted during post-processing.
+The parser tags frames with `event_type` labels for events that frequently occur in Rocket League matches. The rules below describe the implementation order used by the Rust parser: ball-hit candidates are classified first, official replay stat credits are reconciled, frame-derived events are added, then post-processing can promote or relabel rows.
+
+### Shared thresholds
+
+The event rules use these constants:
+
+```text
+ball shot projection window: 3.0 seconds
+goal credited touch window: 120 frames before the goal frame
+pass duplicate window: 20 frames per passer/receiver pair
+missed pass projection window: 2.5 seconds
+missed pass target radius: 450 uu
+missed pass maximum target miss: 1800 uu
+missed pass minimum ball speed: 900 uu/s
+missed pass minimum forward dot: 0.35
+clear buffer: 400 uu around the defensive third line
+field thirds: +/- 5120 / 3 uu on the y axis
+car contact distance: 225 uu
+car contact cooldown: 15 frames per car pair
+demo respawn delay: 90 frames
+demo contact search window: 90 frames before the demo event
+demo duplicate cooldown: 150 frames
+challenge ball distance: 425 uu
+challenge player distance: 750 uu
+challenge duplicate cooldown: 30 frames per player pair
+press carrier distance: 900 uu
+press ball distance: 900 uu
+press duplicate cooldown: 60 frames per defender/carrier pair
+shadow carrier distance: 500-1800 uu
+shadow lateral distance: 1400 uu
+shadow minimum speed toward net: 250 uu/s
+shadow duplicate cooldown: 90 frames per defender/carrier pair
+retrieval duplicate cooldown: 90 frames
+zone event duplicate cooldown: 60 frames per event/team
+whiff ball distance: 285 uu current, 520 uu previous
+whiff pass-by corridor: 145 uu
+whiff speed toward ball: 1150 uu/s, or 800 uu/s with boost/dodge/jump/flip input
+whiff touch exclusion: any touch within 1 frame, or same-player touch within 10 frames
+whiff direct-touch exclusion: same-player next touch within 90 frames
+whiff next-touch requirement: another player touches within 120 frames
+whiff duplicate cooldown: 150 frames per player
+fake possession distance: 560 uu
+fake defender ball distance: 780 uu
+fake defender minimum speed: 575 uu/s
+fake defender speed toward ball: 175 uu/s
+fake ball speed drop: 180 uu/s
+fake ball velocity change: 260 uu/s
+fake ball direction dot threshold: 0.94
+fake duplicate cooldown: 90 frames per carrier/defender pair
+double commit ball distance: 1100 uu
+double commit teammate distance: 1300 uu
+double commit duplicate cooldown: 45 frames per teammate pair
+rotation transition minimum run: 0.5 seconds
+rotation stalled first-man run: 1.5 seconds
+air/ground dribble window: 3.0 seconds
+flick window: 1.0 second
+hood-dribble horizontal distance: 180 uu
+hood-dribble vertical separation: 70-260 uu
+flip-reset contact distance: 230 uu
+flip-reset minimum car z: 120 uu
+flip-reset duplicate cooldown: 30 frames
+double tap window: 5.0 seconds
+double tap offensive back-wall distance: 900 uu for the ball, 700 uu for the car
+double tap back-wall projection window: 3.5 seconds
+shot context windows: rebound 3.0s, off demo 2.0s, off bump 2.0s, off kickoff 5.0s, off challenge/pass/fake/whiff 5.0s, off flip reset 2.0s
+```
 
 ### `touch`
 
-`touch` is a ball touch that is not upgraded to `kickoff`, `pass`, `shot`, `goal`, `turnover`, or `challenge`. In the parser, every detected ball-hit candidate starts as `touch` and remains `touch` unless later logic reclassifies it.
+Every clustered ball-hit candidate starts as `touch`. It remains `touch` only if it is not later reclassified as `kickoff`, `goal`, `shot`, `missed-shot`, `missed-pass`, `exit`, `pass`, `challenge`, or `turnover`, and if official stat reconciliation does not promote or demote it.
 
 ### `turnover`
 
-`turnover` is a touch after which the next eligible touch event belongs to the other team, before any goal, kickoff, or challenge interrupts the sequence. In post-processing, the parser scans forward from each `touch`, and if the next subsequent touch-like event has a different `event_team`, that row is relabeled to `turnover`.
+After challenge processing, each remaining `touch` scans forward until it reaches a `goal`, `kickoff`, or `challenge`. If the first later touch-like row (`touch`, `turnover`, `pass`, `shot`, `goal`, `kickoff`, or `challenge`) belongs to the other team, the original row is relabeled to `turnover`.
 
 ### `pass`
 
-`pass` is a touch followed by the next touch from a different teammate in the same goal sequence, subject to duplicate suppression. In the parser, if adjacent ball events in the same `goal_number` belong to the same team and different players, the first touch is marked `pass`, `event_player_2_*` is set to the receiver, and repeat passer-receiver pairs are suppressed within 20 frames.
+During ball-hit classification, a row is marked `pass` when the next ball event is in the same `goal_number`, is by a different player on the same team, and the same passer/receiver pair has not already been marked within 20 frames. The passer is `event_player_1_*`; the receiver is `event_player_2_*`.
 
 ### `shot`
 
-`shot` is a touch whose ball trajectory projects toward the opponent goal within the shot window, or a touch that is later credited as a save event target but not a goal. In the parser, `shot` is set when `is_shot(event, players)` is true or when the event is already marked `goal`, and official stat reconciliation can later preserve or demote shot credit.
+During ball-hit classification, a row is marked `shot` when the ball is traveling toward the opponent goal, reaches the goal plane in 0.0-3.0 seconds, projects within the posts (`abs(x) <= 892.755`), and projects above ground but no higher than the crossbar (`0 < z <= 642.775`) after gravity. A row is also initially treated as shot-like when it is a credited save target. Official replay shot credits can later promote a nearby candidate to `shot` or synthesize a standalone official `shot` row when no candidate can be matched.
+
+### `missed-shot`
+
+During ball-hit classification, a row is marked `missed-shot` when it is not a `shot` or `goal`, but the ball is traveling toward the opponent goal, reaches the goal plane in 0.0-3.0 seconds, and misses the goal frame. Misses include projected positions outside the posts or above the crossbar, bounded to plausible attempts by `z <= 2044` and `abs(x) <= 3392.755` at the goal plane. `missed-shot` rows are included in `shot_attempts` and xG scoring, but not in official `shots`.
+
+### `missed-pass`
+
+During ball-hit classification, a row is marked `missed-pass` when it is not a completed `pass`, `shot`, `goal`, or `missed-shot`, the ball leaves the touch at least 900 uu/s, and a same-team target is plausibly in the outgoing path. The target must be a teammate other than the passer, the ball velocity must point toward that teammate with dot product at least 0.35, and the sampled ball path over 2.5 seconds must miss the target by more than 450 uu but no more than 1800 uu. Gravity is applied to the sampled ball path. The target teammate is written to `event_player_2_*`. `missed-pass` rows count in `missed_passes` but not in `passes`, `shot_attempts`, or xG.
 
 ### `goal`
 
-`goal` is the final credited attacking touch for a scored goal. In the parser, for each header goal frame, it finds the latest touch by the scorer within 120 frames before the goal and marks that touch as `goal`.
+For each replay-header goal, the parser finds the latest ball-hit candidate by the scorer at or before the goal frame and within 120 frames of that goal frame. That row is marked `goal`. If the scorer has an earlier qualifying `pass` in the same sequence, that passer is copied to `event_player_2_*` and the pass row receives assist credit.
 
 ### `save`
 
-`save` is a defensive touch immediately following an opponent shot that did not become a goal. In the parser, if event `n - 1` is `shot`, not `goal`, and event `n` is touched by the opposing team, event `n` is marked with save credit, which usually lives on the defending touch row, though the parser can also synthesize a standalone `save` row when official save credit needs its own reconciled event frame.
+During ball-hit classification, when the previous ball event is a `shot`, is not a `goal`, and the current ball event belongs to the other team, the current event receives save credit. The parser stores the defender in `event_player_3_*`, points `event_player_1_*` back to the prior shooter, and initially labels the row `shot`; official save reconciliation can later mark the defending row with `official_save` or synthesize a standalone `save` row when no suitable candidate exists.
 
 ### `kickoff`
 
-`kickoff` is the first ball touch after a kickoff start. In the parser, kickoff windows are detected and the first qualifying touch after each kickoff start is relabeled to `kickoff`.
+The first ball-hit candidate selected by the kickoff detector after each kickoff start is relabeled to `kickoff`. Zone events ignore kickoff frames, and post-goal frames are ignored until the next kickoff.
 
 ### `challenge`
 
-`challenge` is a contested touch or car contact where an opposing player is close enough to the ball and toucher to qualify as a challenge, with duplicate suppression and winner assignment. In the parser, it can be created either by promoting a `bump` between opponents near the ball or by promoting a `touch` when an opposing player is within `CHALLENGE_TOUCH_BALL_DISTANCE` of the ball and within `CHALLENGE_TOUCH_PLAYER_DISTANCE` of the toucher, after which `event_player_2_*` is assigned to the challenger, player order may be swapped so `event_player_1_*` is the side that wins the next touch, and duplicate challenge pairs are suppressed inside the cooldown window.
+`challenge` is created in two post-processing paths. First, an opponent `bump` is promoted when either car is within 425 uu of the ball. Second, a `touch` is promoted when the nearest opponent is within 425 uu of the ball and within 750 uu of the toucher. In both paths, the next touch-like row determines the winner: if the opponent's team wins the next touch, player order is swapped so `event_player_1_*` is the winner. Duplicate challenge pairs within 30 frames are reverted to `bump` or `touch`.
+
+### `whiff`
+
+For each consecutive frame pair and player, `whiff` is emitted only after an obvious ball attempt and a true near miss. The player must be within 285 uu of the ball in the current frame or have been within 520 uu in the previous frame, must be moving toward the ball at least 1150 uu/s, or at least 800 uu/s while boost, dodge, jump, double-jump, or flip state is active, and the player/ball paths must show that one went past or around the other. The path test passes when the relative player-ball vector crosses sides within 285 uu, or when the player path or ball path passes within 145 uu after the player and ball are moving apart from their closest approach. The row is skipped if any touch occurs within 1 frame, if that same player touches within 10 frames, if the same player is the next direct ball toucher within 90 frames, if no other player touches the ball within 120 frames, or if the same player already had a whiff within 150 frames.
+
+### `fake`
+
+For each consecutive frame pair, the closest player within 560 uu of the ball in both frames is treated as the possessor. For each opponent, `fake` is emitted when the possessor produces evidence of a feint by slowing the ball at least 180 uu/s, changing ball velocity at least 260 uu/s, or changing ball direction enough that the previous/current velocity dot product is at most 0.94. The defender must be 91.25-780 uu from the ball, moving at least 575 uu/s, moving toward the ball at least 175 uu/s, and satisfy the same pass-by near-miss path test used by `whiff`. The row is skipped if the defender touched the ball near that frame, if the defender is the next direct ball toucher within 90 frames, or if the same possessor/opponent pair already had a fake within 90 frames. When a fake is emitted, a nearby defender `whiff` within the whiff cooldown is removed so feint-caused misses are counted as `fake` instead of both labels. `event_player_1_*` is the possessor; `event_player_2_*` is the defender who missed because of the fake.
+
+### `double-commit`
+
+For each ball-contact row (`touch`, `turnover`, `pass`, `shot`, `missed-shot`, `missed-pass`, `goal`, `kickoff`, or `challenge`), the parser looks for the nearest teammate whose distance to the ball is at most 1100 uu and whose distance to `event_player_1` is at most 1300 uu. If found, it clones the row as `double-commit`, assigns that teammate to `event_player_2_*`, clears official stat flags, and suppresses the same unordered teammate pair for 45 frames.
+
+### `rotation-filled`, `rotation-cut`, and `rotation-stalled`
+
+Rotation events are emitted from per-frame `rotation_role` changes and are enabled by default. Pass `rotation_events=False` to `parse_replay(...)`, or `--no-rotation-events` to the Rust CLI, to disable them. A player must hold the previous role for at least 0.5 seconds before a role change can create `rotation-filled` or `rotation-cut`. `rotation-filled` marks normal advancement through the team rotation, including first man rotating to last man. `rotation-cut` marks skipping ahead in the rotation or first man rotating to a non-last-man role. `rotation-stalled` fires once when a player remains first man for at least 1.5 seconds. Rotation rows set `event_player_1_*` to the rotating player and store the run length in `event_duration`.
 
 ### `shadow`
 
-`shadow` is an off-ball defensive positioning event where a defender is between an opposing ball carrier and the defender's own net while the carrier is moving toward that net. In the parser, it is emitted from frame state when the carrier is the closest possessor, the defender is an opponent at a controlled following distance and lateral alignment, the carrier or ball is moving toward the defender's net, the situation is not close enough to qualify as a challenge, and the defender-carrier pair is outside the shadow cooldown; `event_player_1_*` is the shadowing defender and `event_player_2_*` is the ball carrier.
+For each frame, the closest possessor is treated as the carrier. For each opponent, `shadow` is emitted when the opponent is not challenge-like, is 500-1800 uu from the carrier, is within 1400 uu laterally on x, is between the carrier and the opponent's own net on y, and the ball or carrier is moving toward that net at least 250 uu/s. The same defender/carrier pair is suppressed for 90 frames.
 
 ### `press`
 
-`press` is an off-ball pressure event where an attacker hovers near an opposing ball carrier in the carrier's defensive end without entering challenge range. In the parser, it is emitted from frame state when the carrier is the closest possessor in their own defensive third, an opposing player is close to both the carrier and ball but not close enough to qualify as a challenge, and the defender-carrier pair is outside the press cooldown; `event_player_1_*` is the pressing player and `event_player_2_*` is the ball carrier.
+For each frame, the closest possessor is treated as the carrier. For each opponent, `press` is emitted when the carrier is in their own defensive third, the opponent is within 900 uu of the carrier and 900 uu of the ball, and the pair is not challenge-like (`distance_to_carrier <= 750` and `distance_to_ball <= 425`). The same defender/carrier pair is suppressed for 60 frames.
 
 ### `bump`
 
-`bump` is a non-demo car-to-car contact event that is not retained as a challenge after challenge promotion and deduplication. In the parser, when two cars are within `CAR_CONTACT_DISTANCE`, it emits `bump` with contact distance and relative speed unless the contact is near a demo frame or inside the bump cooldown, and some of these rows are later promoted to `challenge`.
+For each frame and car pair, `bump` is emitted when both cars have position and are within 225 uu. The same unordered pair is suppressed for 15 frames. Contacts within 30 frames of a matching demo pair are skipped. `event_player_1_*` is the faster car, `event_player_2_*` is the other car, and later challenge logic can promote some opponent bumps to `challenge`.
 
 ### `demo`
 
-`demo` is a demolition event with a feature-aligned contact frame. In the parser, official demo events are backtracked to the nearest qualifying car-contact frame within the demo window, and the resulting row is emitted as `demo`.
+`demo` comes from replay demolition data. The parser backtracks from the demo to the first prior frame within 90 frames where the two cars are within 225 uu, records that contact frame, and suppresses duplicate demo pairs for 150 frames. The row includes car-contact distance, relative speed, each player's speed, and demolished flags.
 
 ### `respawn`
 
-`respawn` is a player returning to the field after being demolished. In the parser, each demo victim receives a `respawn` row at the first available frame at or after the standard demo respawn delay, with `event_player_1_*` set to the respawning player so downstream tools can model temporary demo off-field intervals.
+For each demo victim, `respawn` is emitted at the first available frame at or after 90 frames after the demo, with `event_player_1_*` set to the respawning player.
 
 ### `game-join`
 
-`game-join` is a player becoming active on the field for a team. In the parser, it is emitted when the player's team assignment becomes active in the network stream, with an inferred initial join added at the first frame where the player has car state if the explicit assignment was already active before the observed stream.
+`game-join` is emitted when a player's team assignment becomes active in the network stream. If a player already has car state before an explicit join is observed, the parser adds an inferred initial `game-join` at the first frame where the player has car state.
 
 ### `game-leave`
 
-`game-leave` is a player leaving active field play for their team. In the parser, it is emitted when the player's team assignment becomes inactive in the network stream, and downstream stats use it to stop assigning time-on-field and team for/against context until the player joins again.
+`game-leave` is emitted when a player's team assignment becomes inactive in the network stream. Downstream stats use it to stop assigning time-on-field and team for/against context until the next `game-join`.
 
 ### `entry`
 
-`entry` is an attacking team gaining the offensive third. In the parser, it can be emitted either from a ball-zone crossing where the ball moves from neutral or defensive space into that team's offensive third, or from a touch-derived entry where a player touch outside the offensive third is followed by the next ball state entering that team's offensive third, or the touched ball is already moving into it. Rows carry `controlled = true` when the event frame has a same-team closest possessor or `false` when the parser instead attributes the event from the latest same-team touch.
+`entry` uses field thirds at `y = +/- 5120 / 3`. A frame-zone `entry` is emitted when the ball crosses into blue's offensive third (`zone == 1`) or orange's offensive third (`zone == -1`) from any other zone, after the first kickoff and not between a goal and the next kickoff. A touch-derived `entry` is emitted when a non-kickoff, non-exit touch is outside the offensive third and the next same-goal-number ball event enters the offensive third, or the touched ball is already moving toward the opponent half. Duplicate `entry` rows for the same team are suppressed for 60 frames. `controlled = true` when the closest possessor at the event frame is the credited player.
 
 ### `exit`
 
-`exit` is a team clearing the ball out of its defensive third. In the parser, it can be emitted either from a ball-zone crossing where the ball leaves that team's defensive third or from a touch-derived exit where a player touch occurs in that team's defensive third and the next ball state is no longer in the defensive third, or the touched ball is already moving out. This is separate from the first-pass `clear` boolean used during touch classification even though both describe defensive relief.
+`exit` uses field thirds at `y = +/- 5120 / 3`. A frame-zone `exit` is emitted when the ball leaves blue's defensive third (`previous_zone == -1`) or orange's defensive third (`previous_zone == 1`), after the first kickoff and not between a goal and the next kickoff. A touch-derived `exit` is emitted when a non-kickoff, non-exit touch occurs in the team's defensive third and the next same-goal-number ball event is outside that defensive third, or the touched ball is already moving toward the opponent half. Duplicate `exit` rows for the same team are suppressed for 60 frames.
 
 ### `retrieval`
 
-`retrieval` is a team regaining close possession of a free ball after a loose interval. In the parser, while scanning frame states, if there was no prior possessor and a possessor appears after at least 90 frames since the last retrieval, it emits `retrieval` for that player and team.
+While scanning frame states after the first kickoff and outside post-goal dead time, `retrieval` is emitted when the previous frame had no closest possessor, the current frame has a closest possessor, and at least 90 frames have passed since the prior retrieval. The closest possessor becomes `event_player_1_*` and `controlled = true`.
 
 ### `boost-pickup`
 
-`boost-pickup` is a boost gain event inferred from boost amount changes or boost collect state. In the parser, current and prior boost values are compared per player, and it emits `boost-pickup` with `boost_pickup_amount` and `boost_pickup_type` (`small`, `big`, or `reset`) when the inferred pickup threshold is met.
+For each player, `boost-pickup` is emitted when normalized boost increases or the `boost_collect` grant value changes, more than 2 frames have passed since the player's previous pickup, and the inferred pickup amount is positive. The row stores `boost_pickup_amount` and `boost_pickup_type` (`small`, `big`, or `reset`).
 
 ### `flip-reset`
 
-`flip-reset` is a dodge refresh event detected while airborne after a player obtains a reset from contact with either the ball or another car. In the parser, it detects a reset in dodge or double-jump air counters, or an increase in `dodges_refreshed_counter`, then requires the car to be above `FLIP_RESET_MIN_CAR_Z`, enough time since the last reset event, and qualifying underside contact at that frame before emitting `flip-reset`; the row is labeled with `reset_origin`, which is `"ball"`, `"opponent"`, or `"teammate"` depending on the source of the reset contact.
+For each player, `flip-reset` is emitted when the dodge air counter resets from positive to zero, the double-jump air counter resets from positive to zero, or `dodges_refreshed_counter` increases; the car has position; car z is at least 120 uu; and the player's last reset was more than 30 frames earlier. The frame must also have qualifying reset contact within 230 uu, and the row stores `reset_origin` as `ball`, `opponent`, or `teammate`.
+
+### `air-dribble`
+
+`air-dribble` is synthesized from contact rows. For the same player, if the current contact-like event and the previous contact-like event are within 3.0 seconds and either row has `aerialing = true` (`player z >= 642.775`), the current row receives `air_dribble = true` and a cloned `air-dribble` event row is emitted.
+
+### `ground-dribble`
+
+`ground-dribble` is synthesized from contact rows. For the same player, if the current contact-like event and the previous contact-like event are within 3.0 seconds, both qualify as hood-dribble control, and the current row was not marked as an air dribble, the current row receives `ground_dribble = true` and a cloned `ground-dribble` event row is emitted. Hood-dribble control requires the player to be horizontally within 180 uu of the ball and vertically separated from the ball by 70-260 uu.
+
+### `flick`
+
+`flick` is synthesized from contact rows. If a row is already marked as `ground_dribble`, is within 1.0 second of that player's previous contact-like row, the player has flipped, and `ball_vel_z > 250`, the row receives `flick_shot = true` and a cloned `flick` event row is emitted.
 
 ## Documentation
 

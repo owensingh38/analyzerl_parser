@@ -169,7 +169,7 @@ def _replay_files(replay_path: ReplayPathInput) -> list[Path]:
         for item in replay_path:
             paths.extend(_replay_files(item))
 
-        paths = sorted(set(paths))
+        paths = sorted(set(paths), key=lambda path: str(path))
 
         if not paths:
             raise FileNotFoundError("No .replay files found in input list")
@@ -184,7 +184,7 @@ def _replay_files(replay_path: ReplayPathInput) -> list[Path]:
         return [replay_path]
 
     if replay_path.is_dir():
-        paths = sorted(replay_path.rglob("*.replay"))
+        paths = sorted(replay_path.rglob("*.replay"), key=lambda path: str(path))
 
         if not paths:
             raise FileNotFoundError(f"No .replay files found in: {replay_path}")
@@ -430,8 +430,8 @@ def parse_replay(
             added to shot and goal rows.
         gpu: Optional parser GPU mode. Python ``None`` is the default and uses
             CPU only; ``"auto"``, ``"cuda"``, and ``"rocm"`` request GPU.
-        rotation_events: Whether to add ``rotation-filled``,
-            ``rotation-cut``, and ``rotation-stalled`` event rows. Defaults
+        rotation_events: Whether to add ``rotation-fill``,
+            ``rotation-cut``, and ``rotation-stall`` event rows. Defaults
             to ``True``.
 
     Returns:

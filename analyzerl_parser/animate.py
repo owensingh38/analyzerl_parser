@@ -32,7 +32,7 @@ DEMO_RESPAWN_SECONDS = 3.0
 ANIMATION_FRAMES_PER_SECOND = 30.0
 DEFAULT_3D_VIEW_ELEV = 28
 DEFAULT_3D_VIEW_AZIM = -64
-DEFAULT_HIDDEN_EVENT_TYPES = {'boost-pickup', 'game-join', 'kickoff', 'respawn'}
+DEFAULT_HIDDEN_EVENT_TYPES = {'boost-pickup', 'game-join', 'kickoff', 'respawn', 'rotation-fill', 'rotation-cut', 'rotation-stall'}
 BIG_BOOST_PADS = [
     (-3072,-4096), (3072,-4096), 
     (-3584,0), (3584,0), 

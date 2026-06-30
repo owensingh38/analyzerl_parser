@@ -10,7 +10,7 @@ GpuMode: TypeAlias = Literal["auto", "cuda", "rocm"]
 StatsReturnType: TypeAlias = Literal["export", "polars", "pandas", "list"]
 RenderMode: TypeAlias = Literal["2d", "3d"]
 
-__version__ = "1.0.4"
+__version__ = "1.0.5"
 
 def parse_replay(
     replay_path: ReplayPathInput = "data/replays",

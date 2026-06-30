@@ -20,8 +20,6 @@ BACK_WALL_Y = 5120.0
 CROSSBAR_HEIGHT = 642.775
 GROUND_HEIGHT = 20.0
 CEILING_Z = 2044.0
-DOUBLE_COMMIT_BALL_DISTANCE = 1100.0
-DOUBLE_COMMIT_TEAMMATE_DISTANCE = 1300.0
 
 PLAYER_SLOTS = [
     "blue_player_1",
@@ -201,6 +199,8 @@ def requested_columns(
         "event_player_3_name",
         "event_player_3_team",
         "frame_number",
+        "stint_number",
+        "rotation_number",
         "frame_has_event",
         "seconds_elapsed",
         "delta",
@@ -844,48 +844,6 @@ def event_location_breakdowns() -> list[tuple[str, pl.Expr]]:
         ("ceiling", (CEILING_Z - ball_z) <= 350.0),
         ("double_tap", flag_col("double_tap")),
     ]
-
-
-def event_player_team_slots() -> list[tuple[str, list[str]]]:
-    return [
-        (
-            slot,
-            [
-                other
-                for other in PLAYER_SLOTS
-                if other != slot and other[:4] == slot[:4]
-            ],
-        )
-        for slot in PLAYER_SLOTS
-    ]
-
-
-def inferred_double_commit_expr() -> pl.Expr:
-    same_play_commit = pl.any_horizontal(
-        [
-            event_player_slot_condition(slot)
-            & pl.any_horizontal(
-                [
-                    (string_col(f"{teammate}_id") != "")
-                    & (
-                        number_col(f"{teammate}_distance_to_ball")
-                        <= DOUBLE_COMMIT_BALL_DISTANCE
-                    )
-                    & (
-                        number_col(f"{slot}_distance_to_{teammate}")
-                        <= DOUBLE_COMMIT_TEAMMATE_DISTANCE
-                    )
-                    for teammate in teammates
-                ]
-            )
-            for slot, teammates in event_player_team_slots()
-            if teammates
-        ]
-    )
-
-    return (string_col("event_type") == "double-commit") | (
-        touch_event_expr() & same_play_commit
-    )
 
 
 def teammate_bump_expr() -> pl.Expr:
@@ -2208,7 +2166,7 @@ def primary_event_stats(events, has_xg, has_frame_data):
     flick = string_col("event_type") == "flick"
     air_dribble = string_col("event_type").is_in(["air-dribble", "air_dribble"])
     ground_dribble = string_col("event_type").is_in(["ground-dribble", "ground_dribble"])
-    double_commit = inferred_double_commit_expr()
+    double_commit = string_col("event_type") == "double-commit"
     small_boost = boost_pad & (string_col("boost_pickup_type") == "small")
     big_boost = boost_pad & (string_col("boost_pickup_type") == "big")
     boost_amount = scaled_boost_pickup_amount_expr()
@@ -2283,7 +2241,7 @@ def primary_event_stats(events, has_xg, has_frame_data):
         count_if(pl.col("event_type").is_in(["ground-dribble", "ground_dribble"]), "ground_dribbles"),
         count_if(pl.col("event_type") == "flick", "flicks"),
         count_if(pl.col("event_type") == "flip-reset", "flip_resets"),
-        count_if(double_commit, "double_commits"),
+        count_if(double_commit, "double_commits_responsible"),
         sum_if(air_dribble, event_frame_delta_seconds, "time_air_dribble"),
         sum_if(ground_dribble, event_frame_delta_seconds, "time_ground_dribble"),
         avg_if(flick, flick_distance, "avg_flicks_distance"),
@@ -2400,6 +2358,7 @@ def secondary_event_stats(events, has_xg):
     )
     shot = shot_event_expr()
     opponent_bump = opponent_bump_expr()
+    double_commit = string_col("event_type") == "double-commit"
 
     expressions = [
         official_stat_count("assist", assist, "assists"),
@@ -2412,6 +2371,7 @@ def secondary_event_stats(events, has_xg):
         count_if(pl.col("event_type") == "shadow", "shadows_taken"),
         count_if(pl.col("event_type") == "press", "presses_taken"),
         count_if(pl.col("event_type") == "fake", "fakes_taken"),
+        count_if(double_commit, "double_commits_not_responsible"),
     ]
 
     if has_xg:
@@ -2902,6 +2862,12 @@ def calculate_stats_from_lazy_rows(
     ]
 
     stats = stats.with_columns([pl.col(column).fill_null(0) for column in count_columns])
+    stats = stats.with_columns(
+        (
+            number_col("double_commits_responsible")
+            + number_col("double_commits_not_responsible")
+        ).alias("double_commits")
+    )
     stats = recompute_xg_derived_columns(stats, has_xg)
     return finish_stats(stats, group_by=group_by, rates=rates, has_xg=has_xg)
 

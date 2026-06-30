@@ -259,6 +259,8 @@ PBP_ID_COLUMNS = [
     'event_type',
     'official_shot',
     'frame_number',
+    'stint_number',
+    'rotation_number',
     'seconds_elapsed',
     'team_size',
     'event_player_1_id',
